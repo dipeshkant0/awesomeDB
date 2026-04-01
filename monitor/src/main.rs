@@ -205,6 +205,9 @@ fn monitor_main() -> Result<()> {
         let mut db_in = BufReader::new(db_outbound_reader);
         let db_result = handle_db(&mut db_in, &mut db_inbound_writer, &query_config);
 
+        drop(db_in);
+        drop(db_inbound_writer);
+
         db_process.wait()?;
         disk_process.wait()?;
 

@@ -135,43 +135,42 @@ fn db_main() -> Result<()> {
     // Build the Volcano Pipeline 
     let mut root_operator = build_pipeline(query.root, &ctx, &mut pool);
 
-    // Execute: Buffer exactly as raw bytes (Vec<u8>).
+
     let mut output_buffer: Vec<u8> = Vec::new();
     
     eprintln!("=> STARTING VOLCANO PIPELINE...");
+
     while let Some(row) = root_operator.next() {
         output_buffer.extend_from_slice(row.to_output_string().as_bytes());
     }
     
     eprintln!("=> PIPELINE FINISHED! Generated {} bytes of output data.", output_buffer.len());
- 
-    eprintln!("=> SENDING VALIDATE COMMAND...");
     monitor_out.write_all(b"validate\n")?;
     monitor_out.flush()?; 
 
     eprintln!("=> STREAMING DATA TO MONITOR ROW BY ROW...");
-    let mut row_count = 0;
-    let mut start = 0;
+    let mut rows_sent = 0;
 
-    for (i, &b) in output_buffer.iter().enumerate() {
-        if b == b'\n' {
-            let row_bytes = &output_buffer[start..=i];
-            
-            if let Err(e) = monitor_out.write_all(row_bytes) {
-                eprintln!("=> PIPE BROKE AT ROW {}! Error: {}", row_count + 1, e);
-                break;
+    for row in output_buffer.split(|&b| b == b'\n') {
+
+        if row.is_empty() { continue; } 
+
+        let result = monitor_out.write_all(row).and_then(|_| monitor_out.write_all(b"\n"));
+
+        if let Err(e) = result {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                eprintln!("=> MONITOR ABORTED AT ROW {}. Check for mismatch above.", rows_sent + 1);
             }
-            
-            start = i + 1;
-            row_count += 1;
+            return Ok(());
         }
+
+        rows_sent += 1;
     }
     
-    eprintln!("=> SENDING TERMINATION CHARACTER...");
     let _ = monitor_out.write_all(b"!\n");
     let _ = monitor_out.flush();
 
-    eprintln!("=> DATABASE EXITED GRACEFULLY.");
+    eprintln!("=> DATABASE EXITED SUCCESSFULLY WITH ROWS SENT: {}", rows_sent);
     Ok(())
 }
 

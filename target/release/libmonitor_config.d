@@ -1,0 +1,1 @@
+/home/dipesh/Sem2/Database/myDatabase/target/release/libmonitor_config.rlib: /home/dipesh/Sem2/Database/myDatabase/common/src/lib.rs /home/dipesh/Sem2/Database/myDatabase/common/src/query.rs /home/dipesh/Sem2/Database/myDatabase/configs/monitor_config/src/lib.rs /home/dipesh/Sem2/Database/myDatabase/configs/monitor_config/src/monitor_config.rs

@@ -7,6 +7,7 @@ pub struct DiskManager<R: Read, W: Write> {
     disk_out: W,
     pub block_size: usize,
     pub anon_start_block: u64,
+    next_free_anon_block: u64,
 }
 
 impl<R: Read, W: Write> DiskManager<R, W> {
@@ -32,6 +33,7 @@ impl<R: Read, W: Write> DiskManager<R, W> {
                disk_out,
                block_size,
                anon_start_block,
+               next_free_anon_block: anon_start_block,
           }
      }
 
@@ -63,6 +65,12 @@ impl<R: Read, W: Write> DiskManager<R, W> {
           let mut line = String::new();
           self.disk_in.read_line(&mut line).unwrap();
           line.trim().parse().expect("Failed to parse num-blocks")
+     }
+
+     pub fn allocate_anon_blocks(&mut self, num_blocks: u64) -> u64 {
+          let start_block = self.next_free_anon_block;
+          self.next_free_anon_block += num_blocks;
+          start_block
      }
 
 }

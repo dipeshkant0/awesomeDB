@@ -1,14 +1,45 @@
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use common::DataType;
 use db_config::table::ColumnSpec;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum Value {
     Int32(i32),
     Int64(i64),
     Float32(f32),
     Float64(f64),
     String(String),
+}
+
+impl Eq for Value {}
+
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Value::Int32(v) => {
+                1u8.hash(state);
+                v.hash(state);
+            }
+            Value::Int64(v) => {
+                2u8.hash(state);
+                v.hash(state);
+            }
+            Value::Float32(v) => {
+                3u8.hash(state);
+                v.to_bits().hash(state);
+            }
+            Value::Float64(v) => {
+                4u8.hash(state);
+                v.to_bits().hash(state);
+            }
+            Value::String(v) => {
+                5u8.hash(state);
+                v.hash(state);
+            }
+        }
+    }
 }
 
 impl fmt::Display for Value {
@@ -23,7 +54,7 @@ impl fmt::Display for Value {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Row {
     pub values: Vec<Value>,
 }

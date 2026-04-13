@@ -1,6 +1,4 @@
 scratch/
 target/
-tests_gen/
 **/*.log
 **/*.tmp
-**/*.pdf

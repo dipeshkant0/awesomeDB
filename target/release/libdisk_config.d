@@ -1,1 +1,0 @@
-/home/dipesh/Sem2/Database/myDatabase/target/release/libdisk_config.rlib: /home/dipesh/Sem2/Database/myDatabase/configs/disk_config/src/disk_simulation_config.rs /home/dipesh/Sem2/Database/myDatabase/configs/disk_config/src/lib.rs

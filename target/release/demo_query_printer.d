@@ -1,1 +1,0 @@
-/home/dipesh/Sem2/Database/myDatabase/target/release/demo_query_printer: /home/dipesh/Sem2/Database/myDatabase/common/src/lib.rs /home/dipesh/Sem2/Database/myDatabase/common/src/query.rs /home/dipesh/Sem2/Database/myDatabase/demo_query_printer/src/main.rs

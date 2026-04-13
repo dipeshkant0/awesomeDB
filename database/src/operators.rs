@@ -508,22 +508,28 @@ impl<'a, R: Read, W: Write> Operator for SortOperator<'a, R, W> {
 // CROSS OPERATOR
 // ==========================================
 pub struct CrossOperator<'a> {
-    left_child: Box<dyn Operator + 'a>,
-    right_child: Option<Box<dyn Operator + 'a>>, 
-    right_rows: Vec<Row>, 
-    current_left_row: Option<Row>,
-    right_index: usize,
+    left_child: Option<Box<dyn Operator + 'a>>,
+    right_child: Option<Box<dyn Operator + 'a>>,
+    buffered_rows: Vec<Row>,
+    current_stream_row: Option<Row>,
+    buffered_index: usize,
+    materialize_left: bool,
     initialized: bool,
 }
 
 impl<'a> CrossOperator<'a> {
-    pub fn new(left_child: Box<dyn Operator + 'a>, right_child: Box<dyn Operator + 'a>) -> Self {
+    pub fn new(
+        left_child: Box<dyn Operator + 'a>,
+        right_child: Box<dyn Operator + 'a>,
+        materialize_left: bool,
+    ) -> Self {
         Self {
-            left_child,
+            left_child: Some(left_child),
             right_child: Some(right_child),
-            right_rows: Vec::new(),
-            current_left_row: None,
-            right_index: 0,
+            buffered_rows: Vec::new(),
+            current_stream_row: None,
+            buffered_index: 0,
+            materialize_left,
             initialized: false,
         }
     }
@@ -532,40 +538,59 @@ impl<'a> CrossOperator<'a> {
 impl<'a> Operator for CrossOperator<'a> {
     fn next(&mut self) -> Option<Row> {
         if !self.initialized {
-            // Materialize the right child into memory
-            if let Some(mut right) = self.right_child.take() {
-                while let Some(row) = right.next() {
-                    self.right_rows.push(row);
+            if self.materialize_left {
+                if let Some(mut left) = self.left_child.take() {
+                    while let Some(row) = left.next() {
+                        self.buffered_rows.push(row);
+                    }
                 }
+                let right = self.right_child.as_mut().unwrap();
+                self.current_stream_row = right.next();
+            } else {
+                if let Some(mut right) = self.right_child.take() {
+                    while let Some(row) = right.next() {
+                        self.buffered_rows.push(row);
+                    }
+                }
+                let left = self.left_child.as_mut().unwrap();
+                self.current_stream_row = left.next();
             }
             self.initialized = true;
-            self.current_left_row = self.left_child.next();
         }
 
-        if self.right_rows.is_empty() {
+        if self.buffered_rows.is_empty() {
             return None;
         }
 
         loop {
-
-            if self.current_left_row.is_none() {
-                return None; 
+            if self.current_stream_row.is_none() {
+                return None;
             }
 
-            if self.right_index < self.right_rows.len() {
-                
-                let left_row = self.current_left_row.as_ref().unwrap();
-                let right_row = &self.right_rows[self.right_index];
-                self.right_index += 1;
+            if self.buffered_index < self.buffered_rows.len() {
+                let stream_row = self.current_stream_row.as_ref().unwrap();
+                let buffered_row = &self.buffered_rows[self.buffered_index];
+                self.buffered_index += 1;
 
-                let mut combined_values = Vec::with_capacity(left_row.values.len() + right_row.values.len());
-                combined_values.extend(left_row.values.clone());
-                combined_values.extend(right_row.values.clone());
-                
+                let mut combined_values =
+                    Vec::with_capacity(buffered_row.values.len() + stream_row.values.len());
+                if self.materialize_left {
+                    combined_values.extend(buffered_row.values.clone());
+                    combined_values.extend(stream_row.values.clone());
+                } else {
+                    combined_values.extend(stream_row.values.clone());
+                    combined_values.extend(buffered_row.values.clone());
+                }
                 return Some(Row { values: combined_values });
             } else {
-                self.current_left_row = self.left_child.next();
-                self.right_index = 0;
+                self.buffered_index = 0;
+                if self.materialize_left {
+                    let right = self.right_child.as_mut().unwrap();
+                    self.current_stream_row = right.next();
+                } else {
+                    let left = self.left_child.as_mut().unwrap();
+                    self.current_stream_row = left.next();
+                }
             }
         }
     }

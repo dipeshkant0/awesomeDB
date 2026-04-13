@@ -691,10 +691,13 @@ fn build_pipeline<'a, R: Read, W: Write>(
             ))
         }
         QueryOp::Cross(data) => {
+            let left_est = estimate_cardinality(&data.left, ctx);
+            let right_est = estimate_cardinality(&data.right, ctx);
+            let materialize_left = left_est <= right_est;
             let pool_ptr = pool as *mut buffer_pool::BufferPoolManager<R, W>;
             let left = build_pipeline(*data.left, ctx, pool, sort_memory_limit_bytes);
             let right = build_pipeline(*data.right, ctx, unsafe { &mut *pool_ptr }, sort_memory_limit_bytes);
-            Box::new(CrossOperator::new(left, right))
+            Box::new(CrossOperator::new(left, right, materialize_left))
         }
     }
 }

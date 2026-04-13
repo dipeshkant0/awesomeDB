@@ -219,13 +219,47 @@ impl<'a, R: Read, W: Write> Operator for ScanOperator<'a, R, W> {
 // ==========================================
 pub struct FilterOperator<'a> {
     child: Box<dyn Operator + 'a>,
-    predicates: Vec<Predicate>,
-    schema_map: HashMap<String, usize>,
+    predicates: Vec<CompiledPredicate>,
+}
+
+enum CompiledValue {
+    Column(usize),
+    I32(i32),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+    String(String),
+}
+
+struct CompiledPredicate {
+    lhs_idx: usize,
+    operator: ComparisionOperator,
+    rhs: CompiledValue,
 }
 
 impl<'a> FilterOperator<'a> {
     pub fn new(child: Box<dyn Operator + 'a>, predicates: Vec<Predicate>, schema_map: HashMap<String, usize>) -> Self {
-        Self { child, predicates, schema_map }
+        let predicates = predicates
+            .into_iter()
+            .map(|pred| CompiledPredicate {
+                lhs_idx: *schema_map
+                    .get(&pred.column_name)
+                    .expect("Column not found"),
+                operator: pred.operator,
+                rhs: match pred.value {
+                    ComparisionValue::I32(v) => CompiledValue::I32(v),
+                    ComparisionValue::I64(v) => CompiledValue::I64(v),
+                    ComparisionValue::F32(v) => CompiledValue::F32(v),
+                    ComparisionValue::F64(v) => CompiledValue::F64(v),
+                    ComparisionValue::String(v) => CompiledValue::String(v),
+                    ComparisionValue::Column(col_name) => CompiledValue::Column(
+                        *schema_map.get(&col_name).expect("RHS Column not found in join")
+                    ),
+                },
+            })
+            .collect();
+
+        Self { child, predicates }
     }
 }
 
@@ -235,7 +269,7 @@ impl<'a> Operator for FilterOperator<'a> {
             let row = self.child.next()?;
             let mut passes = true;
             for pred in &self.predicates {
-                if !evaluate_predicate(&row, pred, &self.schema_map) {
+                if !evaluate_predicate(&row, pred) {
                     passes = false;
                     break;
                 }
@@ -245,10 +279,7 @@ impl<'a> Operator for FilterOperator<'a> {
     }
 }
 
-fn evaluate_predicate(row: &Row, predicate: &Predicate, schema_map: &HashMap<String, usize>) -> bool {
-    let lhs_idx = schema_map.get(&predicate.column_name).expect("Column not found");
-    let lhs_val = &row.values[*lhs_idx];
-
+fn compare_values(lhs_val: &Value, rhs_val: &Value, operator: &ComparisionOperator) -> bool {
     let as_f64 = |val: &Value| -> Option<f64> {
         match val {
             Value::Int32(v) => Some(*v as f64),
@@ -259,20 +290,8 @@ fn evaluate_predicate(row: &Row, predicate: &Predicate, schema_map: &HashMap<Str
         }
     };
 
-    let rhs_val = match &predicate.value {
-        ComparisionValue::I32(v) => Value::Int32(*v),
-        ComparisionValue::I64(v) => Value::Int64(*v),
-        ComparisionValue::F32(v) => Value::Float32(*v),
-        ComparisionValue::F64(v) => Value::Float64(*v),
-        ComparisionValue::String(v) => Value::String(v.clone()),
-        ComparisionValue::Column(col_name) => {
-            let rhs_idx = schema_map.get(col_name).expect("RHS Column not found in join");
-            row.values[*rhs_idx].clone() 
-        },
-    };
-
-    if let (Some(lhs_num), Some(rhs_num)) = (as_f64(lhs_val), as_f64(&rhs_val)) {
-        return match predicate.operator {
+    if let (Some(lhs_num), Some(rhs_num)) = (as_f64(lhs_val), as_f64(rhs_val)) {
+        return match operator {
             ComparisionOperator::EQ => lhs_num == rhs_num,
             ComparisionOperator::NE => lhs_num != rhs_num,
             ComparisionOperator::GT => lhs_num > rhs_num,
@@ -282,14 +301,26 @@ fn evaluate_predicate(row: &Row, predicate: &Predicate, schema_map: &HashMap<Str
         };
     }
 
-    // Fallback for String comparisons
-    match predicate.operator {
-        ComparisionOperator::EQ => lhs_val == &rhs_val,
-        ComparisionOperator::NE => lhs_val != &rhs_val,
-        ComparisionOperator::GT => lhs_val > &rhs_val,
-        ComparisionOperator::LT => lhs_val < &rhs_val,
-        ComparisionOperator::GTE => lhs_val >= &rhs_val,
-        ComparisionOperator::LTE => lhs_val <= &rhs_val,
+    match operator {
+        ComparisionOperator::EQ => lhs_val == rhs_val,
+        ComparisionOperator::NE => lhs_val != rhs_val,
+        ComparisionOperator::GT => lhs_val > rhs_val,
+        ComparisionOperator::LT => lhs_val < rhs_val,
+        ComparisionOperator::GTE => lhs_val >= rhs_val,
+        ComparisionOperator::LTE => lhs_val <= rhs_val,
+    }
+}
+
+fn evaluate_predicate(row: &Row, predicate: &CompiledPredicate) -> bool {
+    let lhs_val = &row.values[predicate.lhs_idx];
+
+    match &predicate.rhs {
+        CompiledValue::Column(rhs_idx) => compare_values(lhs_val, &row.values[*rhs_idx], &predicate.operator),
+        CompiledValue::I32(v) => compare_values(lhs_val, &Value::Int32(*v), &predicate.operator),
+        CompiledValue::I64(v) => compare_values(lhs_val, &Value::Int64(*v), &predicate.operator),
+        CompiledValue::F32(v) => compare_values(lhs_val, &Value::Float32(*v), &predicate.operator),
+        CompiledValue::F64(v) => compare_values(lhs_val, &Value::Float64(*v), &predicate.operator),
+        CompiledValue::String(v) => compare_values(lhs_val, &Value::String(v.clone()), &predicate.operator),
     }
 }
 
@@ -310,7 +341,7 @@ impl<'a> ProjectOperator<'a> {
 impl<'a> Operator for ProjectOperator<'a> {
     fn next(&mut self) -> Option<Row> {
         let row = self.child.next()?;
-        let mut values = Vec::new();
+        let mut values = Vec::with_capacity(self.column_indices.len());
         for &idx in &self.column_indices {
             values.push(row.values[idx].clone());
         }

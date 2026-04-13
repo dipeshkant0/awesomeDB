@@ -20,15 +20,9 @@ use crate::{
 
 fn resolve_project_mapping<'a>(
     entry: &'a (String, String),
-    child_schema: &HashMap<String, usize>,
+    _child_schema: &HashMap<String, usize>,
 ) -> (&'a String, &'a String) {
-    let first_in_child = child_schema.contains_key(&entry.0);
-    let second_in_child = child_schema.contains_key(&entry.1);
-
-    match (first_in_child, second_in_child) {
-        (true, false) => (&entry.1, &entry.0),
-        _ => (&entry.0, &entry.1),
-    }
+    (&entry.1, &entry.0)
 }
 
 // Tracks the actual column layout as it changes through Projections and Cross Joins

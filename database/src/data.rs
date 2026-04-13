@@ -176,15 +176,17 @@ impl Row {
 }
 
 pub fn deserialize_block(data: &[u8], columns: &[ColumnSpec]) -> Vec<Row> {
-    let mut rows = Vec::new();
-    if data.len() < 2 { return rows; }
+    if data.len() < 2 {
+        return Vec::new();
+    }
 
     let map_capacity = data.len() - 2;
     let row_count = u16::from_le_bytes([data[map_capacity], data[map_capacity + 1]]) as usize;
+    let mut rows = Vec::with_capacity(row_count);
     let mut offset = 0;
 
     for _ in 0..row_count {
-        let mut values = Vec::new();
+        let mut values = Vec::with_capacity(columns.len());
         let mut row_valid = true;
 
         for col in columns {
@@ -219,7 +221,13 @@ pub fn deserialize_block(data: &[u8], columns: &[ColumnSpec]) -> Vec<Row> {
                         end += 1;
                     }
                     if end >= map_capacity { row_valid = false; break; }
-                    let s = String::from_utf8_lossy(&data[offset..end]).to_string();
+                    let s = match std::str::from_utf8(&data[offset..end]) {
+                        Ok(s) => s.to_owned(),
+                        Err(_) => {
+                            row_valid = false;
+                            break;
+                        }
+                    };
                     values.push(Value::String(s));
                     offset = end + 1;
                 }

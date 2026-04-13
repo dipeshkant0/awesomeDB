@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 
@@ -44,6 +45,21 @@ impl<R: Read, W: Write> DiskManager<R, W> {
           self.disk_out.flush().unwrap();
      }
 
+     pub fn read_pages_direct(&mut self, start_block: u64, num_blocks: usize) -> Vec<u8> {
+          let mut buffer = vec![0; num_blocks * self.block_size];
+          write!(self.disk_out, "get block {} {}\n", start_block, num_blocks).unwrap();
+          self.disk_out.flush().unwrap();
+          self.disk_in.read_exact(&mut buffer).unwrap();
+          buffer
+     }
+
+     pub fn write_pages_direct(&mut self, start_block: u64, num_blocks: usize, buffer: &[u8]) {
+          assert!(start_block >= self.anon_start_block, "Cannot write to Read-Only region!");
+          write!(self.disk_out, "put block {} {}\n", start_block, num_blocks).unwrap();
+          self.disk_out.write_all(buffer).unwrap();
+          self.disk_out.flush().unwrap();
+     }
+
      pub fn get_file_start_block(&mut self, file_id: &str) -> u64 {
           write!(self.disk_out, "get file start-block {}\n", file_id).unwrap();
           self.disk_out.flush().unwrap();
@@ -79,6 +95,7 @@ impl<R: Read, W: Write> DiskManager<R, W> {
      }
 }
 
+
 pub struct Frame {
     pub data: Vec<u8>,         
     pub is_dirty: bool,       
@@ -113,14 +130,17 @@ impl<R: Read, W: Write> BufferPoolManager<R, W> {
      }
 
      pub fn fetch_page(&mut self, block_id: u64) -> Result<usize, String> {
+          // Cache Hit
           if let Some(&frame_id) = self.page_table.get(&block_id) {
                self.frames[frame_id].pin_count += 1;
-               self.frames[frame_id].referenced = true; // Mark as recently used
+               self.frames[frame_id].referenced = true; // Mark used for CLOCK
                return Ok(frame_id);
           }
 
+          // Cache Miss
           let frame_id = self.find_victim_frame()?;
 
+          // Evict old page if necessary
           if let Some(old_block_id) = self.frames[frame_id].block_id {
                if self.frames[frame_id].is_dirty {
                     self.disk_manager.write_page(old_block_id, &self.frames[frame_id].data);
@@ -128,6 +148,7 @@ impl<R: Read, W: Write> BufferPoolManager<R, W> {
                self.page_table.remove(&old_block_id);
           }
 
+          // Load new page
           self.disk_manager.read_page(block_id, &mut self.frames[frame_id].data);
           
           self.frames[frame_id].block_id = Some(block_id);
@@ -151,6 +172,14 @@ impl<R: Read, W: Write> BufferPoolManager<R, W> {
           }
      }
 
+     pub fn read_pages_direct(&mut self, start_block: u64, num_blocks: usize) -> Vec<u8> {
+          self.disk_manager.read_pages_direct(start_block, num_blocks)
+     }
+
+     pub fn write_pages_direct(&mut self, start_block: u64, num_blocks: usize, buffer: &[u8]) {
+          self.disk_manager.write_pages_direct(start_block, num_blocks, buffer)
+     }
+
      fn find_victim_frame(&mut self) -> Result<usize, String> {
           if let Some(frame_id) = self.free_list.pop_front() {
                return Ok(frame_id);
@@ -166,6 +195,7 @@ impl<R: Read, W: Write> BufferPoolManager<R, W> {
                     if frame.referenced {
                          frame.referenced = false; // Give a second chance
                     } else {
+                         // Evict
                          let victim = self.clock_hand;
                          self.clock_hand = (self.clock_hand + 1) % self.frames.len();
                          return Ok(victim);

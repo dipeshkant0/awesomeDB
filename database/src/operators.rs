@@ -5,16 +5,38 @@ use crate::data::{Row, Value};
 use crate::buffer_pool::BufferPoolManager;
 use common::query::{Predicate, ComparisionValue, ComparisionOperator};
 use db_config::table::TableSpec;
+use std::hash::{BuildHasherDefault, Hasher, Hash};
+
+
+pub struct Fnv1aHasher(u64);
+
+impl Default for Fnv1aHasher {
+    fn default() -> Self { Self(0xcbf29ce484222325) }
+}
+
+impl Hasher for Fnv1aHasher {
+    fn finish(&self) -> u64 { self.0 }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= byte as u64;
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+}
+
+pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<Fnv1aHasher>>;
+
 
 struct ScratchRun {
     block_ids: Vec<u64>,
     total_bytes: usize,
 }
 
+
 struct ScratchRunWriter<'a, R: Read, W: Write> {
     pool_ptr: *mut BufferPoolManager<R, W>,
     block_size: usize,
-    current_block: Vec<u8>,
+    current_blocks: Vec<u8>,
     offset: usize,
     block_ids: Vec<u64>,
     total_bytes: usize,
@@ -22,8 +44,13 @@ struct ScratchRunWriter<'a, R: Read, W: Write> {
 }
 
 impl<'a, R: Read, W: Write> ScratchRunWriter<'a, R, W> {
-    fn new(pool_ptr: *mut BufferPoolManager<R, W>, block_size: usize) -> Self {
-        Self { pool_ptr, block_size, current_block: vec![0; block_size], offset: 0, block_ids: Vec::new(), total_bytes: 0, _marker: std::marker::PhantomData }
+    fn new(pool_ptr: *mut BufferPoolManager<R, W>, block_size: usize, capacity_blocks: usize) -> Self {
+        Self { 
+            pool_ptr, block_size, 
+            current_blocks: vec![0; block_size * capacity_blocks], 
+            offset: 0, block_ids: Vec::new(), total_bytes: 0, 
+            _marker: std::marker::PhantomData 
+        }
     }
 
     fn write_row(&mut self, row: &Row) {
@@ -33,29 +60,39 @@ impl<'a, R: Read, W: Write> ScratchRunWriter<'a, R, W> {
         self.write_bytes(&encoded);
     }
 
-    fn finish(mut self) -> ScratchRun {
-        if self.offset > 0 { self.flush_block(); }
-        ScratchRun { block_ids: self.block_ids, total_bytes: self.total_bytes }
-    }
-
     fn write_bytes(&mut self, mut bytes: &[u8]) {
         self.total_bytes += bytes.len();
         while !bytes.is_empty() {
-            if self.offset == self.block_size { self.flush_block(); }
-            let writable = (self.block_size - self.offset).min(bytes.len());
-            self.current_block[self.offset..self.offset + writable].copy_from_slice(&bytes[..writable]);
+            if self.offset == self.current_blocks.len() { self.flush_buffer(); }
+            let writable = (self.current_blocks.len() - self.offset).min(bytes.len());
+            self.current_blocks[self.offset..self.offset + writable].copy_from_slice(&bytes[..writable]);
             self.offset += writable;
             bytes = &bytes[writable..];
         }
     }
 
-    fn flush_block(&mut self) {
+    fn flush_buffer(&mut self) {
+        if self.offset == 0 { return; }
         let pool = unsafe { &mut *self.pool_ptr };
-        let block_id = pool.disk_manager.allocate_anon_blocks(1);
-        pool.disk_manager.write_page(block_id, &self.current_block);
-        self.block_ids.push(block_id);
-        self.current_block.fill(0);
+        let num_blocks = (self.offset + self.block_size - 1) / self.block_size; 
+        
+        let start_block = pool.disk_manager.allocate_anon_blocks(num_blocks as u64);
+        
+        let valid_len = self.offset;
+        let target_len = num_blocks * self.block_size;
+        self.current_blocks[valid_len..target_len].fill(0);
+
+        pool.write_pages_direct(start_block, num_blocks, &self.current_blocks[0..target_len]);
+        
+        for i in 0..num_blocks {
+            self.block_ids.push(start_block + (i as u64));
+        }
         self.offset = 0;
+    }
+
+    fn finish(mut self) -> ScratchRun {
+        self.flush_buffer();
+        ScratchRun { block_ids: self.block_ids, total_bytes: self.total_bytes }
     }
 }
 
@@ -68,12 +105,13 @@ struct ScratchRunReader<'a, R: Read, W: Write> {
     current_block: Vec<u8>,
     offset: usize,
     loaded: bool,
+    free_on_drop: bool,
     _marker: std::marker::PhantomData<&'a mut BufferPoolManager<R, W>>,
 }
 
 impl<'a, R: Read, W: Write> ScratchRunReader<'a, R, W> {
-    fn new(pool_ptr: *mut BufferPoolManager<R, W>, block_ids: Vec<u64>, total_bytes: usize, block_size: usize) -> Self {
-        Self { pool_ptr, block_ids, total_bytes, bytes_read: 0, block_idx: 0, current_block: vec![0; block_size], offset: 0, loaded: false, _marker: std::marker::PhantomData }
+    fn new(pool_ptr: *mut BufferPoolManager<R, W>, block_ids: Vec<u64>, total_bytes: usize, block_size: usize, free_on_drop: bool) -> Self {
+        Self { pool_ptr, block_ids, total_bytes, bytes_read: 0, block_idx: 0, current_block: vec![0; block_size], offset: 0, loaded: false, free_on_drop, _marker: std::marker::PhantomData }
     }
 
     fn read_row(&mut self) -> Option<Row> {
@@ -103,10 +141,20 @@ impl<'a, R: Read, W: Write> ScratchRunReader<'a, R, W> {
 
     fn ensure_block_loaded(&mut self) -> Option<()> {
         if !self.loaded || self.offset == self.current_block.len() {
-            let block_id = *self.block_ids.get(self.block_idx)?;
+            let start_block_id = *self.block_ids.get(self.block_idx)?;
+
+            let mut num_blocks = 1;
+            while self.block_idx + num_blocks < self.block_ids.len() && num_blocks < 16 {
+                if self.block_ids[self.block_idx + num_blocks] == start_block_id + (num_blocks as u64) {
+                    num_blocks += 1;
+                } else {
+                    break;
+                }
+            }
+
             let pool = unsafe { &mut *self.pool_ptr };
-            pool.disk_manager.read_page(block_id, &mut self.current_block);
-            self.block_idx += 1;
+            self.current_block = pool.read_pages_direct(start_block_id, num_blocks);
+            self.block_idx += num_blocks;
             self.offset = 0;
             self.loaded = true;
         }
@@ -116,9 +164,11 @@ impl<'a, R: Read, W: Write> ScratchRunReader<'a, R, W> {
 
 impl<'a, R: Read, W: Write> Drop for ScratchRunReader<'a, R, W> {
     fn drop(&mut self) {
-        let pool = unsafe { &mut *self.pool_ptr };
-        for &id in &self.block_ids {
-            pool.disk_manager.free_anon_block(id);
+        if self.free_on_drop {
+            let pool = unsafe { &mut *self.pool_ptr };
+            for &id in &self.block_ids {
+                pool.disk_manager.free_anon_block(id);
+            }
         }
     }
 }
@@ -164,22 +214,27 @@ impl Ord for HeapEntry {
 
 pub trait Operator { fn next(&mut self) -> Option<Row>; }
 
-// ==========================================
-// SCAN OPERATOR
-// ==========================================
+
 pub struct ScanOperator<'a, R: Read, W: Write> {
     table_spec: &'a TableSpec,
     buffer_pool: &'a mut BufferPoolManager<R, W>,
     current_block_id: u64,
     end_block_id: u64,
     current_rows: std::vec::IntoIter<Row>,
+    prefetch_buffer: Vec<u8>,
+    prefetch_offset: usize,
+    blocks_in_buffer: usize,
 }
 
 impl<'a, R: Read, W: Write> ScanOperator<'a, R, W> {
     pub fn new(table_id: &str, table_spec: &'a TableSpec, buffer_pool: &'a mut BufferPoolManager<R, W>) -> Self {
         let start_block = buffer_pool.disk_manager.get_file_start_block(table_id);
         let num_blocks = buffer_pool.disk_manager.get_file_num_blocks(table_id);
-        Self { table_spec, buffer_pool, current_block_id: start_block, end_block_id: start_block + num_blocks, current_rows: Vec::new().into_iter() }
+        Self { 
+            table_spec, buffer_pool, current_block_id: start_block, end_block_id: start_block + num_blocks, 
+            current_rows: Vec::new().into_iter(),
+            prefetch_buffer: Vec::new(), prefetch_offset: 0, blocks_in_buffer: 0
+        }
     }
 }
 
@@ -187,15 +242,25 @@ impl<'a, R: Read, W: Write> Operator for ScanOperator<'a, R, W> {
     fn next(&mut self) -> Option<Row> {
         loop {
             if let Some(row) = self.current_rows.next() { return Some(row); }
-            self.current_rows = Vec::new().into_iter();
 
-            if self.current_block_id < self.end_block_id {
-                let frame_id = self.buffer_pool.fetch_page(self.current_block_id).unwrap();
-                let data = self.buffer_pool.get_frame_data(frame_id);
+            if self.prefetch_offset < self.blocks_in_buffer {
+                let block_size = self.buffer_pool.disk_manager.block_size;
+                let start = self.prefetch_offset * block_size;
+                let data = &self.prefetch_buffer[start..start + block_size];
                 let rows = crate::data::deserialize_block(data, &self.table_spec.column_specs);
                 self.current_rows = rows.into_iter();
-                self.buffer_pool.unpin_page(self.current_block_id, false);
-                self.current_block_id += 1;
+                self.prefetch_offset += 1;
+                continue;
+            }
+
+            if self.current_block_id < self.end_block_id {
+                let max_blocks = 64; 
+                let blocks_to_read = (self.end_block_id - self.current_block_id).min(max_blocks) as usize;
+                
+                self.prefetch_buffer = self.buffer_pool.read_pages_direct(self.current_block_id, blocks_to_read);
+                self.blocks_in_buffer = blocks_to_read;
+                self.prefetch_offset = 0;
+                self.current_block_id += blocks_to_read as u64;
             } else {
                 return None;
             }
@@ -203,9 +268,7 @@ impl<'a, R: Read, W: Write> Operator for ScanOperator<'a, R, W> {
     }
 }
 
-// ==========================================
-// FILTER OPERATOR
-// ==========================================
+//Filter operator
 pub struct FilterOperator<'a> {
     child: Box<dyn Operator + 'a>,
     predicates: Vec<CompiledPredicate>,
@@ -253,25 +316,33 @@ impl<'a> Operator for FilterOperator<'a> {
 }
 
 fn compare_values(lhs_val: &Value, rhs_val: &Value, operator: &ComparisionOperator) -> bool {
-    let as_f64 = |val: &Value| -> Option<f64> {
-        match val {
-            Value::Int32(v) => Some(*v as f64), Value::Int64(v) => Some(*v as f64),
-            Value::Float32(v) => Some(*v as f64), Value::Float64(v) => Some(*v),
-            Value::String(_) => None,
-        }
-    };
-    if let (Some(lhs_num), Some(rhs_num)) = (as_f64(lhs_val), as_f64(rhs_val)) {
+    if std::mem::discriminant(lhs_val) == std::mem::discriminant(rhs_val) {
         return match operator {
-            ComparisionOperator::EQ => lhs_num == rhs_num, ComparisionOperator::NE => lhs_num != rhs_num,
-            ComparisionOperator::GT => lhs_num > rhs_num, ComparisionOperator::LT => lhs_num < rhs_num,
-            ComparisionOperator::GTE => lhs_num >= rhs_num, ComparisionOperator::LTE => lhs_num <= rhs_num,
+            ComparisionOperator::EQ => lhs_val == rhs_val,
+            ComparisionOperator::NE => lhs_val != rhs_val,
+            ComparisionOperator::GT => lhs_val > rhs_val,
+            ComparisionOperator::LT => lhs_val < rhs_val,
+            ComparisionOperator::GTE => lhs_val >= rhs_val,
+            ComparisionOperator::LTE => lhs_val <= rhs_val,
         };
     }
-    match operator {
-        ComparisionOperator::EQ => lhs_val == rhs_val, ComparisionOperator::NE => lhs_val != rhs_val,
-        ComparisionOperator::GT => lhs_val > rhs_val, ComparisionOperator::LT => lhs_val < rhs_val,
-        ComparisionOperator::GTE => lhs_val >= rhs_val, ComparisionOperator::LTE => lhs_val <= rhs_val,
+
+    let get_num = |v: &Value| -> Option<f64> {
+        match v {
+            Value::Int32(n) => Some(*n as f64), Value::Int64(n) => Some(*n as f64),
+            Value::Float32(n) => Some(*n as f64), Value::Float64(n) => Some(*n),
+            _ => None,
+        }
+    };
+
+    if let (Some(l), Some(r)) = (get_num(lhs_val), get_num(rhs_val)) {
+        return match operator {
+            ComparisionOperator::EQ => l == r, ComparisionOperator::NE => l != r,
+            ComparisionOperator::GT => l > r, ComparisionOperator::LT => l < r,
+            ComparisionOperator::GTE => l >= r, ComparisionOperator::LTE => l <= r,
+        };
     }
+    false
 }
 
 fn evaluate_predicate(row: &Row, predicate: &CompiledPredicate) -> bool {
@@ -284,11 +355,9 @@ fn evaluate_predicate(row: &Row, predicate: &CompiledPredicate) -> bool {
         CompiledValue::F32(v) => compare_values(lhs_val, &Value::Float32(*v), &predicate.operator),
         CompiledValue::F64(v) => compare_values(lhs_val, &Value::Float64(*v), &predicate.operator),
         CompiledValue::String(v) => {
-            // High Performance String Comparison directly on references
             if let Value::String(arc_str) = lhs_val {
                 let lhs_str: &str = arc_str;
                 let rhs_str: &str = v;
-                
                 match predicate.operator {
                     ComparisionOperator::EQ => lhs_str == rhs_str,
                     ComparisionOperator::NE => lhs_str != rhs_str,
@@ -304,9 +373,7 @@ fn evaluate_predicate(row: &Row, predicate: &CompiledPredicate) -> bool {
     }
 }
 
-// ==========================================
-// PROJECT OPERATOR
-// ==========================================
+//project operator
 pub struct ProjectOperator<'a> {
     child: Box<dyn Operator + 'a>,
     column_indices: Vec<usize>,
@@ -327,9 +394,7 @@ impl<'a> Operator for ProjectOperator<'a> {
     }
 }
 
-// ==========================================
-// SORT OPERATOR
-// ==========================================
+//sort operator
 pub struct SortOperator<'a, R: Read, W: Write> {
     child: Box<dyn Operator + 'a>,
     sort_indices: Vec<(usize, bool)>, 
@@ -350,7 +415,13 @@ impl<'a, R: Read, W: Write> SortOperator<'a, R, W> {
     }
 
     fn estimate_row_size(row: &Row) -> usize {
-        std::mem::size_of::<Row>() + (row.values.capacity() * std::mem::size_of::<Value>())
+        let mut size = std::mem::size_of::<Row>() + (row.values.capacity() * std::mem::size_of::<Value>());
+        for value in &row.values {
+            if let Value::String(s) = value {
+                size += s.len(); 
+            }
+        }
+        size
     }
 
     fn merge_fan_in(&self) -> usize {
@@ -363,17 +434,17 @@ impl<'a, R: Read, W: Write> SortOperator<'a, R, W> {
         let mut readers = Vec::with_capacity(runs.len());
         let mut heap = BinaryHeap::new();
         for (run_idx, run) in runs.into_iter().enumerate() {
-            let mut reader = ScratchRunReader::new(self.scratch_pool_ptr, run.block_ids, run.total_bytes, self.scratch_block_size);
+            let mut reader = ScratchRunReader::new(self.scratch_pool_ptr, run.block_ids, run.total_bytes, self.scratch_block_size, true);
             if let Some(row) = reader.read_row() { heap.push(HeapEntry::new(row, run_idx, &self.sort_indices)); }
             readers.push(reader);
         }
-        let mut writer = ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size);
+        // Use 16-block buffers for Sorting 
+        let mut writer = ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size, 16);
         while let Some(mut top_entry) = heap.peek_mut() {
             writer.write_row(&top_entry.row);
             if let Some(next_row) = readers[top_entry.run_idx].read_row() {
                 top_entry.row = next_row;
             } else {
-               
                 std::collections::binary_heap::PeekMut::pop(top_entry);
             }
         }
@@ -410,7 +481,8 @@ impl<'a, R: Read, W: Write> Operator for SortOperator<'a, R, W> {
                 if current_memory >= self.memory_limit_bytes {
                     self.is_external = true;
                     current_run.sort_by(|a, b| HeapEntry::compare_rows(&self.sort_indices, a, b));
-                    let mut writer = ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size);
+                    // Safe 16-block writer
+                    let mut writer = ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size, 16);
                     for r in &current_run { writer.write_row(r); }
                     self.runs.push(writer.finish());
 
@@ -422,7 +494,7 @@ impl<'a, R: Read, W: Write> Operator for SortOperator<'a, R, W> {
             if !current_run.is_empty() {
                 current_run.sort_by(|a, b| HeapEntry::compare_rows(&self.sort_indices, a, b));
                 if self.is_external {
-                    let mut writer = ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size);
+                    let mut writer = ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size, 16);
                     for r in &current_run { writer.write_row(r); }
                     self.runs.push(writer.finish());
                 } else {
@@ -433,7 +505,7 @@ impl<'a, R: Read, W: Write> Operator for SortOperator<'a, R, W> {
             if self.is_external {
                 self.collapse_runs();
                 for run in self.runs.drain(..) {
-                    let mut reader = ScratchRunReader::new(self.scratch_pool_ptr, run.block_ids, run.total_bytes, self.scratch_block_size);
+                    let mut reader = ScratchRunReader::new(self.scratch_pool_ptr, run.block_ids, run.total_bytes, self.scratch_block_size, true);
                     if let Some(row) = reader.read_row() {
                         let run_idx = self.run_readers.len();
                         self.merge_heap.push(HeapEntry::new(row, run_idx, &self.sort_indices));
@@ -459,77 +531,118 @@ impl<'a, R: Read, W: Write> Operator for SortOperator<'a, R, W> {
     }
 }
 
-// ==========================================
-// CROSS OPERATOR
-// ==========================================
-pub struct CrossOperator<'a> {
+
+pub struct CrossOperator<'a, R: Read, W: Write> {
     left_child: Option<Box<dyn Operator + 'a>>,
     right_child: Option<Box<dyn Operator + 'a>>,
-    buffered_rows: Vec<Row>,
-    current_stream_row: Option<Row>,
-    buffered_index: usize,
     materialize_left: bool,
+    
+    scratch_pool_ptr: *mut BufferPoolManager<R, W>,
+    scratch_block_size: usize,
+    
+    spilled_run: Option<ScratchRun>,
+    current_reader: Option<ScratchRunReader<'a, R, W>>,
+    
+    stream_chunk: Vec<Row>,
+    stream_chunk_idx: usize,
+    current_spilled_row: Option<Row>,
+    stream_exhausted: bool,
+    
     initialized: bool,
 }
 
-impl<'a> CrossOperator<'a> {
-    pub fn new(left_child: Box<dyn Operator + 'a>, right_child: Box<dyn Operator + 'a>, materialize_left: bool) -> Self {
-        Self { left_child: Some(left_child), right_child: Some(right_child), buffered_rows: Vec::new(), current_stream_row: None, buffered_index: 0, materialize_left, initialized: false }
+impl<'a, R: Read, W: Write> CrossOperator<'a, R, W> {
+    pub fn new(
+        left_child: Box<dyn Operator + 'a>, right_child: Box<dyn Operator + 'a>, 
+        materialize_left: bool, scratch_pool_ptr: *mut BufferPoolManager<R, W>, scratch_block_size: usize
+    ) -> Self {
+        Self { 
+            left_child: Some(left_child), right_child: Some(right_child), 
+            materialize_left, scratch_pool_ptr, scratch_block_size,
+            spilled_run: None, current_reader: None, 
+            stream_chunk: Vec::new(), stream_chunk_idx: 0, current_spilled_row: None, stream_exhausted: false,
+            initialized: false 
+        }
     }
 }
 
-impl<'a> Operator for CrossOperator<'a> {
+impl<'a, R: Read, W: Write> Drop for CrossOperator<'a, R, W> {
+    fn drop(&mut self) {
+        if let Some(run) = &self.spilled_run {
+            let pool = unsafe { &mut *self.scratch_pool_ptr };
+            for &id in &run.block_ids {
+                pool.disk_manager.free_anon_block(id);
+            }
+        }
+    }
+}
+
+impl<'a, R: Read, W: Write> Operator for CrossOperator<'a, R, W> {
     fn next(&mut self) -> Option<Row> {
         if !self.initialized {
+            let mut writer = ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size, 32);
             if self.materialize_left {
-                if let Some(mut left) = self.left_child.take() {
-                    while let Some(row) = left.next() { self.buffered_rows.push(row); }
-                }
-                let right = self.right_child.as_mut().unwrap();
-                self.current_stream_row = right.next();
+                let mut left = self.left_child.take().unwrap();
+                while let Some(row) = left.next() { writer.write_row(&row); }
             } else {
-                if let Some(mut right) = self.right_child.take() {
-                    while let Some(row) = right.next() { self.buffered_rows.push(row); }
-                }
-                let left = self.left_child.as_mut().unwrap();
-                self.current_stream_row = left.next();
+                let mut right = self.right_child.take().unwrap();
+                while let Some(row) = right.next() { writer.write_row(&row); }
             }
+            self.spilled_run = Some(writer.finish());
             self.initialized = true;
         }
 
-        if self.buffered_rows.is_empty() { return None; }
+        if self.spilled_run.as_ref().unwrap().total_bytes == 0 { return None; }
 
         loop {
-            if self.current_stream_row.is_none() { return None; }
-
-            if self.buffered_index < self.buffered_rows.len() {
-                let stream_row = self.current_stream_row.as_ref().unwrap();
-                let buffered_row = &self.buffered_rows[self.buffered_index];
-                self.buffered_index += 1;
-
-                let (left_row, right_row) = if self.materialize_left {
-                    (buffered_row, stream_row)
-                } else {
-                    (stream_row, buffered_row)
-                };
-                return Some(Row::combine(left_row, right_row));
-            } else {
-                self.buffered_index = 0;
-                if self.materialize_left {
-                    let right = self.right_child.as_mut().unwrap();
-                    self.current_stream_row = right.next();
-                } else {
-                    let left = self.left_child.as_mut().unwrap();
-                    self.current_stream_row = left.next();
+            if self.stream_chunk.is_empty() {
+                if self.stream_exhausted { return None; }
+                
+                // Load up to 2MB of streaming rows at once
+                let mut chunk_bytes = 0;
+                let stream = if self.materialize_left { self.right_child.as_mut().unwrap() } else { self.left_child.as_mut().unwrap() };
+                
+                while chunk_bytes < 2 * 1024 * 1024 {
+                    if let Some(row) = stream.next() {
+                        chunk_bytes += std::mem::size_of::<Row>() + (row.values.capacity() * std::mem::size_of::<Value>());
+                        self.stream_chunk.push(row);
+                    } else {
+                        self.stream_exhausted = true;
+                        break;
+                    }
                 }
+                
+                if self.stream_chunk.is_empty() { return None; }
+                
+                // Rewind the spilled disk run
+                let run_ref = self.spilled_run.as_ref().unwrap();
+                self.current_reader = Some(ScratchRunReader::new(self.scratch_pool_ptr, run_ref.block_ids.clone(), run_ref.total_bytes, self.scratch_block_size, false));
+                self.current_spilled_row = self.current_reader.as_mut().unwrap().read_row();
+                self.stream_chunk_idx = 0;
+            }
+            
+            if let Some(spilled_row) = &self.current_spilled_row {
+                if self.stream_chunk_idx < self.stream_chunk.len() {
+                    let stream_row = &self.stream_chunk[self.stream_chunk_idx];
+                    let result = if self.materialize_left {
+                        Row::combine(spilled_row, stream_row)
+                    } else {
+                        Row::combine(stream_row, spilled_row)
+                    };
+                    self.stream_chunk_idx += 1;
+                    return Some(result);
+                } else {
+                    self.stream_chunk_idx = 0;
+                    self.current_spilled_row = self.current_reader.as_mut().unwrap().read_row();
+                }
+            } else {
+                // Done with this disk pass, clear chunk to fetch the next streaming batch
+                self.stream_chunk.clear();
             }
         }
     }
 }
 
-// ==========================================
-// HASH JOIN OPERATOR
-// ==========================================
 pub struct HashJoinOperator<'a> {
     left_child: Option<Box<dyn Operator + 'a>>,
     right_child: Option<Box<dyn Operator + 'a>>,
@@ -537,7 +650,7 @@ pub struct HashJoinOperator<'a> {
     right_col_idx: usize,
     build_on_left: bool,
     build_rows: Vec<Row>,
-    hash_table: HashMap<Value, Vec<usize>>,
+    hash_table: FastMap<Value, Vec<usize>>,
     current_probe_row: Option<Row>,
     current_match_key: Option<Value>,
     current_match_index: usize,
@@ -546,7 +659,7 @@ pub struct HashJoinOperator<'a> {
 
 impl<'a> HashJoinOperator<'a> {
     pub fn new(left_child: Box<dyn Operator + 'a>, right_child: Box<dyn Operator + 'a>, left_col_idx: usize, right_col_idx: usize, build_on_left: bool) -> Self {
-        Self { left_child: Some(left_child), right_child: Some(right_child), left_col_idx, right_col_idx, build_on_left, build_rows: Vec::new(), hash_table: HashMap::new(), current_probe_row: None, current_match_key: None, current_match_index: 0, initialized: false }
+        Self { left_child: Some(left_child), right_child: Some(right_child), left_col_idx, right_col_idx, build_on_left, build_rows: Vec::new(), hash_table: FastMap::default(), current_probe_row: None, current_match_key: None, current_match_index: 0, initialized: false }
     }
 }
 
@@ -627,8 +740,7 @@ pub struct GraceHashJoinOperator<'a, R: Read, W: Write> {
     build_partitions: Vec<ScratchRun>,
     probe_partitions: Vec<ScratchRun>,
     
-    // Contiguous Memory Optimization 
-    in_memory_hash_table: HashMap<Value, Vec<usize>>,
+    in_memory_hash_table: FastMap<Value, Vec<usize>>,
     in_memory_build_rows: Vec<Row>,
 
     current_probe_reader: Option<ScratchRunReader<'a, R, W>>,
@@ -648,16 +760,14 @@ impl<'a, R: Read, W: Write> GraceHashJoinOperator<'a, R, W> {
             left_child: Some(left_child), right_child: Some(right_child), left_col_idx, right_col_idx, 
             build_on_left, num_partitions, scratch_pool_ptr, scratch_block_size, 
             build_partitions: Vec::new(), probe_partitions: Vec::new(), 
-            in_memory_hash_table: HashMap::new(), in_memory_build_rows: Vec::new(),
+            in_memory_hash_table: FastMap::default(), in_memory_build_rows: Vec::new(),
             current_probe_reader: None, current_probe_row: None, current_match_key: None, 
             current_match_index: 0, state: JoinState::Partitioning 
         }
     }
 
     fn calculate_hash(val: &Value) -> usize {
-        use std::hash::{Hash, Hasher};
-        use std::collections::hash_map::DefaultHasher;
-        let mut s = DefaultHasher::new();
+        let mut s = Fnv1aHasher::default();
         val.hash(&mut s);
         s.finish() as usize
     }
@@ -671,8 +781,9 @@ impl<'a, R: Read, W: Write> Operator for GraceHashJoinOperator<'a, R, W> {
                     let mut build_writers = Vec::with_capacity(self.num_partitions);
                     let mut probe_writers = Vec::with_capacity(self.num_partitions);
                     for _ in 0..self.num_partitions {
-                        build_writers.push(ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size));
-                        probe_writers.push(ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size));
+                        // FIX: Use tiny 2-block buffers (8 KB) to prevent 128 partitions from triggering OOM
+                        build_writers.push(ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size, 2));
+                        probe_writers.push(ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size, 2));
                     }
                     
                     let mut build_child = if self.build_on_left { self.left_child.take() } else { self.right_child.take() }.unwrap();
@@ -704,7 +815,7 @@ impl<'a, R: Read, W: Write> Operator for GraceHashJoinOperator<'a, R, W> {
                     self.in_memory_build_rows.clear();
                     
                     let build_run = self.build_partitions.remove(0); 
-                    let mut reader = ScratchRunReader::new(self.scratch_pool_ptr, build_run.block_ids, build_run.total_bytes, self.scratch_block_size);
+                    let mut reader = ScratchRunReader::new(self.scratch_pool_ptr, build_run.block_ids, build_run.total_bytes, self.scratch_block_size, true);
                     
                     let build_idx = if self.build_on_left { self.left_col_idx } else { self.right_col_idx };
                     while let Some(row) = reader.read_row() {
@@ -715,13 +826,14 @@ impl<'a, R: Read, W: Write> Operator for GraceHashJoinOperator<'a, R, W> {
                     }
                     
                     let probe_run = self.probe_partitions.remove(0);
-                    self.current_probe_reader = Some(ScratchRunReader::new(self.scratch_pool_ptr, probe_run.block_ids, probe_run.total_bytes, self.scratch_block_size));
+                    self.current_probe_reader = Some(ScratchRunReader::new(self.scratch_pool_ptr, probe_run.block_ids, probe_run.total_bytes, self.scratch_block_size, true));
                     self.current_probe_row = self.current_probe_reader.as_mut().unwrap().read_row();
                     self.state = JoinState::Probing;
                 }
                 
                 JoinState::Probing => {
                     if self.current_probe_row.is_none() {
+                        self.current_probe_reader = None; 
                         self.state = JoinState::LoadingBuild;
                         continue;
                     }

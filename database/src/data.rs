@@ -10,7 +10,7 @@ pub enum Value {
     Int64(i64),
     Float32(f32),
     Float64(f64),
-    String(Arc<str>), // High Performance: Zero-copy clones using standard library Arc
+    String(Arc<str>),
 }
 
 impl Eq for Value {}

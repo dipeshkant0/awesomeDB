@@ -183,7 +183,8 @@ fn estimate_cardinality(op: &QueryOp, ctx: &DbContext) -> f64 {
             for p in &data.predicates {
                 combined_selectivity *= calculate_selectivity(p, ctx);
             }
-            child_est * combined_selectivity
+            let safe_selectivity = combined_selectivity.max(0.05); 
+            child_est * safe_selectivity
         }
         QueryOp::Cross(data) => estimate_cardinality(&data.left, ctx) * estimate_cardinality(&data.right, ctx),
         QueryOp::Project(data) => estimate_cardinality(&data.underlying, ctx),
@@ -663,13 +664,13 @@ fn build_pipeline<'a, R: Read, W: Write>(
                         estimated_bytes_for_op(&cross_data.right, ctx)
                     };
 
-                    let hash_join_memory_budget = sort_memory_limit_bytes.saturating_mul(3);
+                    let hash_join_memory_budget = sort_memory_limit_bytes.saturating_mul(1);
                     let pool_ptr = pool as *mut buffer_pool::BufferPoolManager<R, W>;
                     let left_child = build_pipeline(*cross_data.left, ctx, pool, sort_memory_limit_bytes);
                     let right_child = build_pipeline(*cross_data.right, ctx, unsafe { &mut *pool_ptr }, sort_memory_limit_bytes);
 
                     let hash_join: Box<dyn Operator + 'a> = if estimated_build_bytes > hash_join_memory_budget {
-                        let num_partitions = (estimated_build_bytes / (hash_join_memory_budget / 2)).clamp(4, 128) as usize;
+                        let num_partitions = (estimated_build_bytes / (hash_join_memory_budget / 2)).clamp(16, 128) as usize;
                         let scratch_block_size = unsafe { &*pool_ptr }.disk_manager.block_size;
                         
                         Box::new(crate::operators::GraceHashJoinOperator::new(
@@ -729,10 +730,13 @@ fn build_pipeline<'a, R: Read, W: Write>(
             let left_est = estimate_cardinality(&data.left, ctx);
             let right_est = estimate_cardinality(&data.right, ctx);
             let materialize_left = left_est <= right_est;
+            
             let pool_ptr = pool as *mut buffer_pool::BufferPoolManager<R, W>;
+            let scratch_block_size = unsafe { &*pool_ptr }.disk_manager.block_size;
+            
             let left = build_pipeline(*data.left, ctx, pool, sort_memory_limit_bytes);
             let right = build_pipeline(*data.right, ctx, unsafe { &mut *pool_ptr }, sort_memory_limit_bytes);
-            Box::new(CrossOperator::new(left, right, materialize_left))
+            Box::new(CrossOperator::new(left, right, materialize_left, pool_ptr, scratch_block_size))
         }
     }
 }

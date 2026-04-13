@@ -13,7 +13,7 @@ members = [
     "tests_gen",
 ]
 
-resolver = "2"
+resolver = "3"
 
 [profile.profiling]
 inherits = "release"

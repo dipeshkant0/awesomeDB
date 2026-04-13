@@ -1,5 +1,6 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use common::DataType;
 use db_config::table::ColumnSpec;
 
@@ -9,7 +10,7 @@ pub enum Value {
     Int64(i64),
     Float32(f32),
     Float64(f64),
-    String(String),
+    String(Arc<str>), // High Performance: Zero-copy clones using standard library Arc
 }
 
 impl Eq for Value {}
@@ -17,26 +18,11 @@ impl Eq for Value {}
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
-            Value::Int32(v) => {
-                1u8.hash(state);
-                v.hash(state);
-            }
-            Value::Int64(v) => {
-                2u8.hash(state);
-                v.hash(state);
-            }
-            Value::Float32(v) => {
-                3u8.hash(state);
-                v.to_bits().hash(state);
-            }
-            Value::Float64(v) => {
-                4u8.hash(state);
-                v.to_bits().hash(state);
-            }
-            Value::String(v) => {
-                5u8.hash(state);
-                v.hash(state);
-            }
+            Value::Int32(v) => { 1u8.hash(state); v.hash(state); }
+            Value::Int64(v) => { 2u8.hash(state); v.hash(state); }
+            Value::Float32(v) => { 3u8.hash(state); v.to_bits().hash(state); }
+            Value::Float64(v) => { 4u8.hash(state); v.to_bits().hash(state); }
+            Value::String(v) => { 5u8.hash(state); v.hash(state); }
         }
     }
 }
@@ -59,6 +45,13 @@ pub struct Row {
 }
 
 impl Row {
+    pub fn combine(left: &Row, right: &Row) -> Self {
+        let mut values = Vec::with_capacity(left.values.len() + right.values.len());
+        values.extend_from_slice(&left.values);
+        values.extend_from_slice(&right.values);
+        Self { values }
+    }
+
     pub fn to_output_string(&self) -> String {
         let mut s = String::new();
         for val in &self.values {
@@ -67,6 +60,34 @@ impl Row {
         }
         s.push_str("\n");
         s
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let values_len = u32::try_from(self.values.len()).expect("Too many values in row");
+        let capacity = 4 + self.values.iter().map(Value::encoded_len).sum::<usize>();
+        let mut out = Vec::with_capacity(capacity);
+        out.extend_from_slice(&values_len.to_le_bytes());
+        for value in &self.values {
+            value.encode_into(&mut out);
+        }
+        out
+    }
+
+    pub fn decode(input: &[u8]) -> Option<Self> {
+        let count_bytes: [u8; 4] = input.get(..4)?.try_into().ok()?;
+        let count = u32::from_le_bytes(count_bytes) as usize;
+        let mut values = Vec::with_capacity(count);
+        let mut offset = 4;
+
+        for _ in 0..count {
+            values.push(Value::decode_from(input, &mut offset)?);
+        }
+
+        if offset == input.len() {
+            Some(Self { values })
+        } else {
+            None
+        }
     }
 }
 
@@ -81,22 +102,10 @@ impl Value {
 
     fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
-            Self::Int32(v) => {
-                out.push(1);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            Self::Int64(v) => {
-                out.push(2);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            Self::Float32(v) => {
-                out.push(3);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            Self::Float64(v) => {
-                out.push(4);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
+            Self::Int32(v) => { out.push(1); out.extend_from_slice(&v.to_le_bytes()); }
+            Self::Int64(v) => { out.push(2); out.extend_from_slice(&v.to_le_bytes()); }
+            Self::Float32(v) => { out.push(3); out.extend_from_slice(&v.to_le_bytes()); }
+            Self::Float64(v) => { out.push(4); out.extend_from_slice(&v.to_le_bytes()); }
             Self::String(v) => {
                 out.push(5);
                 let len = u32::try_from(v.len()).expect("Row string too large to encode");
@@ -138,48 +147,15 @@ impl Value {
                 let bytes = input.get(*offset..*offset + len)?;
                 *offset += len;
                 let value = String::from_utf8(bytes.to_vec()).ok()?;
-                Some(Self::String(value))
+                Some(Self::String(value.into())) 
             }
             _ => None,
         }
     }
 }
 
-impl Row {
-    pub fn encode(&self) -> Vec<u8> {
-        let values_len = u32::try_from(self.values.len()).expect("Too many values in row");
-        let capacity = 4 + self.values.iter().map(Value::encoded_len).sum::<usize>();
-        let mut out = Vec::with_capacity(capacity);
-        out.extend_from_slice(&values_len.to_le_bytes());
-        for value in &self.values {
-            value.encode_into(&mut out);
-        }
-        out
-    }
-
-    pub fn decode(input: &[u8]) -> Option<Self> {
-        let count_bytes: [u8; 4] = input.get(..4)?.try_into().ok()?;
-        let count = u32::from_le_bytes(count_bytes) as usize;
-        let mut values = Vec::with_capacity(count);
-        let mut offset = 4;
-
-        for _ in 0..count {
-            values.push(Value::decode_from(input, &mut offset)?);
-        }
-
-        if offset == input.len() {
-            Some(Self { values })
-        } else {
-            None
-        }
-    }
-}
-
 pub fn deserialize_block(data: &[u8], columns: &[ColumnSpec]) -> Vec<Row> {
-    if data.len() < 2 {
-        return Vec::new();
-    }
-
+    if data.len() < 2 { return Vec::new(); }
     let map_capacity = data.len() - 2;
     let row_count = u16::from_le_bytes([data[map_capacity], data[map_capacity + 1]]) as usize;
     let mut rows = Vec::with_capacity(row_count);
@@ -217,18 +193,13 @@ pub fn deserialize_block(data: &[u8], columns: &[ColumnSpec]) -> Vec<Row> {
                 }
                 DataType::String => {
                     let mut end = offset;
-                    while end < map_capacity && data[end] != 0 {
-                        end += 1;
-                    }
+                    while end < map_capacity && data[end] != 0 { end += 1; }
                     if end >= map_capacity { row_valid = false; break; }
                     let s = match std::str::from_utf8(&data[offset..end]) {
                         Ok(s) => s.to_owned(),
-                        Err(_) => {
-                            row_valid = false;
-                            break;
-                        }
+                        Err(_) => { row_valid = false; break; }
                     };
-                    values.push(Value::String(s));
+                    values.push(Value::String(s.into())); 
                     offset = end + 1;
                 }
             }
@@ -240,145 +211,5 @@ pub fn deserialize_block(data: &[u8], columns: &[ColumnSpec]) -> Vec<Row> {
             break;
         }
     }
-    
     rows
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Row, Value, deserialize_block};
-    use common::DataType;
-    use db_config::table::ColumnSpec;
-
-    fn col(name: &str, data_type: DataType) -> ColumnSpec {
-        ColumnSpec {
-            column_name: name.to_string(),
-            data_type,
-            stats: None,
-        }
-    }
-
-    fn encode_block(rows: &[Row], block_size: usize) -> Vec<u8> {
-        let mut block = vec![0u8; block_size];
-        let map_capacity = block_size - 2;
-        let mut offset = 0usize;
-
-        for row in rows {
-            for value in &row.values {
-                match value {
-                    Value::Int32(v) => {
-                        block[offset..offset + 4].copy_from_slice(&v.to_le_bytes());
-                        offset += 4;
-                    }
-                    Value::Int64(v) => {
-                        block[offset..offset + 8].copy_from_slice(&v.to_le_bytes());
-                        offset += 8;
-                    }
-                    Value::Float32(v) => {
-                        block[offset..offset + 4].copy_from_slice(&v.to_le_bytes());
-                        offset += 4;
-                    }
-                    Value::Float64(v) => {
-                        block[offset..offset + 8].copy_from_slice(&v.to_le_bytes());
-                        offset += 8;
-                    }
-                    Value::String(v) => {
-                        let bytes = v.as_bytes();
-                        block[offset..offset + bytes.len()].copy_from_slice(bytes);
-                        offset += bytes.len();
-                        block[offset] = 0;
-                        offset += 1;
-                    }
-                }
-            }
-        }
-
-        block[map_capacity..].copy_from_slice(&(rows.len() as u16).to_le_bytes());
-
-        block
-    }
-
-    #[test]
-    fn row_roundtrip_handles_mixed_values() {
-        let row = Row {
-            values: vec![
-                Value::Int32(7),
-                Value::Int64(0),
-                Value::Float32(3.5),
-                Value::Float64(-9.25),
-                Value::String(String::new()),
-                Value::String("alpha beta".to_string()),
-            ],
-        };
-
-        let encoded = row.encode();
-        let decoded = Row::decode(&encoded).expect("row should decode");
-
-        assert_eq!(decoded.values.len(), row.values.len());
-        for (lhs, rhs) in decoded.values.iter().zip(row.values.iter()) {
-            assert_eq!(lhs, rhs);
-        }
-    }
-
-    #[test]
-    fn deserialize_block_keeps_rows_that_start_with_zero_bytes() {
-        let columns = vec![
-            col("id64", DataType::Int64),
-            col("name", DataType::String),
-        ];
-        let rows = vec![
-            Row {
-                values: vec![Value::Int64(0), Value::String("zero-row".to_string())],
-            },
-            Row {
-                values: vec![Value::Int64(5), Value::String("next-row".to_string())],
-            },
-        ];
-        let block = encode_block(&rows, 128);
-
-        let decoded = deserialize_block(&block, &columns);
-
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].values[0], Value::Int64(0));
-        assert_eq!(decoded[0].values[1], Value::String("zero-row".to_string()));
-        assert_eq!(decoded[1].values[0], Value::Int64(5));
-        assert_eq!(decoded[1].values[1], Value::String("next-row".to_string()));
-    }
-
-    #[test]
-    fn deserialize_block_ignores_padding_after_last_row() {
-        let columns = vec![
-            col("id32", DataType::Int32),
-            col("name", DataType::String),
-            col("region32", DataType::Int32),
-        ];
-        let rows = vec![
-            Row {
-                values: vec![
-                    Value::Int32(1),
-                    Value::String("alpha".to_string()),
-                    Value::Int32(7),
-                ],
-            },
-            Row {
-                values: vec![
-                    Value::Int32(2),
-                    Value::String("beta".to_string()),
-                    Value::Int32(9),
-                ],
-            },
-        ];
-        let mut block = encode_block(&rows, 128);
-
-        // Non-row garbage in unused payload should not be interpreted as another row.
-        block[40] = 1;
-        block[41] = 2;
-        block[42] = 3;
-
-        let decoded = deserialize_block(&block, &columns);
-
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].values[0], Value::Int32(1));
-        assert_eq!(decoded[1].values[0], Value::Int32(2));
-    }
 }

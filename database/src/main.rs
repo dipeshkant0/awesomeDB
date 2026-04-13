@@ -25,9 +25,7 @@ fn resolve_project_mapping<'a>(
     (&entry.1, &entry.0)
 }
 
-// Tracks the actual column layout as it changes through Projections and Cross Joins
 fn get_output_schema(op_node: &QueryOp, ctx: &DbContext) -> HashMap<String, usize> {
-
     match op_node {
         QueryOp::Scan(data) => {
             let mut map = HashMap::new();
@@ -44,7 +42,7 @@ fn get_output_schema(op_node: &QueryOp, ctx: &DbContext) -> HashMap<String, usiz
             let mut map = HashMap::new();
             for (i, mapping) in data.column_name_map.iter().enumerate() {
                 let (out_name, _src_name) = resolve_project_mapping(mapping, &child_schema);
-                map.insert(out_name.clone(), i); // Projection redefines the indices!
+                map.insert(out_name.clone(), i); 
             }
             map
         }
@@ -52,7 +50,6 @@ fn get_output_schema(op_node: &QueryOp, ctx: &DbContext) -> HashMap<String, usiz
             let mut left_map = get_output_schema(&data.left, ctx);
             let right_map = get_output_schema(&data.right, ctx);
             let offset = left_map.len();
-            // Append right columns to left schema, shifted by the left's size
             for (k, v) in right_map {
                 left_map.insert(k, v + offset);
             }
@@ -61,7 +58,6 @@ fn get_output_schema(op_node: &QueryOp, ctx: &DbContext) -> HashMap<String, usiz
     }
 }
 
-// Helper to get base table size from JSON stats
 fn get_base_cardinality(table_name: &str, ctx: &DbContext) -> f64 {
     use db_config::statistics::ColumnStat;
     let spec = ctx.get_table_specs().iter().find(|t| t.name == table_name);
@@ -83,7 +79,6 @@ fn get_base_cardinality(table_name: &str, ctx: &DbContext) -> f64 {
     1000.0
 }
 
-// Helper to cast `Data` from statistics to f64 for math
 fn stat_data_as_f64(data: &common::Data) -> Option<f64> {
     match data {
         common::Data::Int32(v) => Some(*v as f64),
@@ -94,7 +89,6 @@ fn stat_data_as_f64(data: &common::Data) -> Option<f64> {
     }
 }
 
-// Helper to cast `ComparisionValue` from queries to f64
 fn comp_val_as_f64(val: &common::query::ComparisionValue) -> Option<f64> {
     match val {
         common::query::ComparisionValue::I32(v) => Some(*v as f64),
@@ -105,12 +99,10 @@ fn comp_val_as_f64(val: &common::query::ComparisionValue) -> Option<f64> {
     }
 }
 
-// Dynamically calculates the selectivity fraction (0.0 to 1.0) of a predicate
 fn calculate_selectivity(predicate: &common::query::Predicate, ctx: &DbContext) -> f64 {
     use db_config::statistics::ColumnStat;
     use common::query::ComparisionOperator;
 
-    // Locate the column's statistics in the catalog
     let mut column_stats = None;
     for table in ctx.get_table_specs() {
         if let Some(col) = table.column_specs.iter().find(|c| c.column_name == predicate.column_name) {
@@ -155,7 +147,6 @@ fn calculate_selectivity(predicate: &common::query::Predicate, ctx: &DbContext) 
             0.9
         }
         ComparisionOperator::GT | ComparisionOperator::GTE | ComparisionOperator::LT | ComparisionOperator::LTE => {
-            // For Range queries we need min and max to estimate the fraction of the data that satisfies the predicate
             let mut min_val = None;
             let mut max_val = None;
             
@@ -168,7 +159,7 @@ fn calculate_selectivity(predicate: &common::query::Predicate, ctx: &DbContext) 
             }
 
             if let (Some(min), Some(max), Some(val)) = (min_val, max_val, comp_val_as_f64(&predicate.value)) {
-                if max <= min { return default_range; } // Avoid division by zero
+                if max <= min { return default_range; } 
                 
                 let fraction = match predicate.operator {
                     ComparisionOperator::GT | ComparisionOperator::GTE => (max - val) / (max - min),
@@ -188,13 +179,10 @@ fn estimate_cardinality(op: &QueryOp, ctx: &DbContext) -> f64 {
         QueryOp::Scan(data) => get_base_cardinality(&data.table_id, ctx),
         QueryOp::Filter(data) => {
             let child_est = estimate_cardinality(&data.underlying, ctx);
-            
-            // Multiply selectivity of all predicates together (assuming they are independent)
             let mut combined_selectivity = 1.0;
             for p in &data.predicates {
                 combined_selectivity *= calculate_selectivity(p, ctx);
             }
-            
             child_est * combined_selectivity
         }
         QueryOp::Cross(data) => estimate_cardinality(&data.left, ctx) * estimate_cardinality(&data.right, ctx),
@@ -363,7 +351,6 @@ fn reorder_cross_branches(
     }
 }
 
-// possibly optimize the AST by pushing down filters and projections, and reordering cross joins based on predicate connectivity and estimated size
 fn optimize_ast(op_node: QueryOp, ctx: &DbContext) -> QueryOp {
     match op_node {
         QueryOp::Scan(_) => op_node,
@@ -372,13 +359,11 @@ fn optimize_ast(op_node: QueryOp, ctx: &DbContext) -> QueryOp {
             let optimized_child = optimize_ast(*filter_data.underlying, ctx);
 
             match optimized_child {
-                // Filter Pushdown
                 QueryOp::Sort(mut sort_data) => {
                     filter_data.underlying = sort_data.underlying;
                     sort_data.underlying = Box::new(optimize_ast(QueryOp::Filter(filter_data), ctx));
                     QueryOp::Sort(sort_data)
                 }
-                //Filter Pushdown (Through Projection)
                 QueryOp::Project(mut proj_data) => {
                     let child_schema = get_output_schema(&proj_data.underlying, ctx);
                     for pred in &mut filter_data.predicates {
@@ -403,7 +388,6 @@ fn optimize_ast(op_node: QueryOp, ctx: &DbContext) -> QueryOp {
                     proj_data.underlying = Box::new(optimize_ast(QueryOp::Filter(filter_data), ctx));
                     QueryOp::Project(proj_data)
                 }
-                // Filter Pushdown (Through Cross Join) with Dynamic Reordering
                 QueryOp::Cross(cross_data) => {
                     let mut cross_data = reorder_cross_branches(cross_data, &filter_data.predicates, ctx);
                     let left_schema = get_output_schema(&cross_data.left, ctx);
@@ -413,18 +397,14 @@ fn optimize_ast(op_node: QueryOp, ctx: &DbContext) -> QueryOp {
                     let mut keep_p = Vec::new();
 
                     for p in filter_data.predicates {
-                
-                        // Determine if the predicate can be fully evaluated in the Left branch, the Right branch, or if it must be kept above the Cross Join
                         let mut all_in_left = left_schema.contains_key(&p.column_name);
                         let mut all_in_right = right_schema.contains_key(&p.column_name);
 
-                        // Check RHS columns in predicates to determine if they also fit entirely in one branch
                         if let common::query::ComparisionValue::Column(ref rhs_col) = p.value {
                             all_in_left = all_in_left && left_schema.contains_key(rhs_col);
                             all_in_right = all_in_right && right_schema.contains_key(rhs_col);
                         }
 
-                        // Push down only if both columns exist in that branch
                         if all_in_left {
                             left_p.push(p);
                         } else if all_in_right {
@@ -464,7 +444,6 @@ fn optimize_ast(op_node: QueryOp, ctx: &DbContext) -> QueryOp {
             let proj_child_schema = get_output_schema(&proj_data.underlying, ctx);
             let optimized_child = optimize_ast(*proj_data.underlying, ctx);
             match optimized_child {
-                //Intermediate Projection below Sort 
                 QueryOp::Sort(mut sort_data) => {
                     let mut new_map = Vec::new();
                     let mut added = std::collections::HashSet::new();
@@ -486,8 +465,6 @@ fn optimize_ast(op_node: QueryOp, ctx: &DbContext) -> QueryOp {
                         underlying: Box::new(QueryOp::Sort(sort_data)),
                     })
                 }
-
-                //Intermediate projection below filter
                 QueryOp::Filter(mut filter_data) => {
                     if has_join_predicates(&filter_data.predicates) {
                         if let QueryOp::Cross(mut cross_data) = *filter_data.underlying {
@@ -560,7 +537,6 @@ fn optimize_ast(op_node: QueryOp, ctx: &DbContext) -> QueryOp {
                         let (_, src) = resolve_project_mapping(mapping, &proj_child_schema);
                         if added.insert(src.clone()) { new_map.push((src.clone(), src.clone())); }
                     }
-                    // Join keys are explicitly preserved here
                     for pred in &filter_data.predicates {
                         if added.insert(pred.column_name.clone()) { new_map.push((pred.column_name.clone(), pred.column_name.clone())); }
                         if let common::query::ComparisionValue::Column(ref rhs) = pred.value {
@@ -584,7 +560,6 @@ fn optimize_ast(op_node: QueryOp, ctx: &DbContext) -> QueryOp {
                     })
                 }
 
-                // If it's a cross join, we can push projections down both sides to minimize data early on
                 QueryOp::Cross(mut cross_data) => {
                     let left_schema = get_output_schema(&cross_data.left, ctx);
                     let right_schema = get_output_schema(&cross_data.right, ctx);
@@ -657,7 +632,6 @@ fn build_pipeline<'a, R: Read, W: Write>(
                 let left_schema = get_output_schema(&cross_data.left, ctx);
                 let right_schema = get_output_schema(&cross_data.right, ctx);
 
-                // Only intercept if the condition spans both sides.
                 let mut join_pred_idx = None;
                 for (i, pred) in data.predicates.iter().enumerate() {
                     if matches!(pred.operator, common::query::ComparisionOperator::EQ) {
@@ -689,30 +663,24 @@ fn build_pipeline<'a, R: Read, W: Write>(
                         estimated_bytes_for_op(&cross_data.right, ctx)
                     };
 
-                    // Hash join has no spill path. Use a conservative but realistic threshold:
-                    // sort_memory_limit_bytes is only the external-sort budget, not the whole process budget.
                     let hash_join_memory_budget = sort_memory_limit_bytes.saturating_mul(3);
-                    if estimated_build_bytes > hash_join_memory_budget {
-                        data.underlying = Box::new(QueryOp::Cross(cross_data));
-                        let schema = get_output_schema(&data.underlying, ctx);
-                        return Box::new(FilterOperator::new(
-                            build_pipeline(*data.underlying, ctx, pool, sort_memory_limit_bytes),
-                            data.predicates,
-                            schema,
-                        ));
-                    }
-
                     let pool_ptr = pool as *mut buffer_pool::BufferPoolManager<R, W>;
                     let left_child = build_pipeline(*cross_data.left, ctx, pool, sort_memory_limit_bytes);
                     let right_child = build_pipeline(*cross_data.right, ctx, unsafe { &mut *pool_ptr }, sort_memory_limit_bytes);
 
-                    let hash_join = Box::new(HashJoinOperator::new(
-                        left_child,
-                        right_child,
-                        left_col_idx,
-                        right_col_idx,
-                        build_on_left,
-                    ));
+                    let hash_join: Box<dyn Operator + 'a> = if estimated_build_bytes > hash_join_memory_budget {
+                        let num_partitions = (estimated_build_bytes / (hash_join_memory_budget / 2)).clamp(4, 128) as usize;
+                        let scratch_block_size = unsafe { &*pool_ptr }.disk_manager.block_size;
+                        
+                        Box::new(crate::operators::GraceHashJoinOperator::new(
+                            left_child, right_child, left_col_idx, right_col_idx,
+                            build_on_left, num_partitions, pool_ptr, scratch_block_size,
+                        ))
+                    } else {
+                        Box::new(HashJoinOperator::new(
+                            left_child, right_child, left_col_idx, right_col_idx, build_on_left,
+                        ))
+                    };
 
                     data.predicates.remove(idx);
 
@@ -754,10 +722,7 @@ fn build_pipeline<'a, R: Read, W: Write>(
             let pool_ptr = pool as *mut buffer_pool::BufferPoolManager<R, W>;
             Box::new(SortOperator::new(
                 build_pipeline(*data.underlying, ctx, pool, sort_memory_limit_bytes),
-                indices,
-                sort_memory_limit_bytes,
-                pool_ptr,
-                scratch_block_size,
+                indices, sort_memory_limit_bytes, pool_ptr, scratch_block_size,
             ))
         }
         QueryOp::Cross(data) => {
@@ -783,36 +748,31 @@ fn db_main() -> Result<()> {
     let disk_buf_reader = BufReader::new(disk_in);
     let mut monitor_buf_reader = BufReader::new(monitor_in);
 
-    // Read the Query AST
     let mut input_line = String::new();
     monitor_buf_reader.read_line(&mut input_line)?;
     let mut query: Query = serde_json::from_str(&input_line).context("JSON Parse Error")?;
 
     query.root = optimize_ast(query.root, &ctx);
 
-    // Read the Memory Limit
     input_line.clear();
     monitor_out.write_all(b"get_memory_limit\n")?;
     monitor_out.flush()?;
     monitor_buf_reader.read_line(&mut input_line)?;
 
     let memory_limit_mb: u32 = input_line.trim().parse().context("Memory parse error")?;
-    let disk_manager = buffer_pool::DiskManager::new(disk_buf_reader, disk_out); // DiskManager will take ownership of the disk reader and writer, and handle all disk I/O through them.
-    let total_mem = memory_limit_mb as u64 * 1024 * 1024; // convert MB to Bytes
+    let disk_manager = buffer_pool::DiskManager::new(disk_buf_reader, disk_out); 
+    let total_mem = memory_limit_mb as u64 * 1024 * 1024; 
     let pool_mem = (total_mem / 16).max(4 * 1024 * 1024);
     let num_frames = (pool_mem / 4096) as usize;
     let sort_memory_limit_bytes = ((total_mem / 8).max(8 * 1024 * 1024)) as usize;
     
     let mut pool = buffer_pool::BufferPoolManager::new(disk_manager, num_frames); 
 
-    // Build the Volcano Pipeline 
     let mut root_operator = build_pipeline(query.root, &ctx, &mut pool, sort_memory_limit_bytes);
 
-    // Send the validate command first, so the Monitor starts listening
     monitor_out.write_all(b"validate\n")?;
     monitor_out.flush()?; 
 
-    // Pull rows one-by-one and send them instantly to the pipe
     while let Some(row) = root_operator.next() {
         let row_string = row.to_output_string();
         
@@ -821,7 +781,6 @@ fn db_main() -> Result<()> {
         }
     }
     
-    // Terminate successfully
     let _ = monitor_out.write_all(b"!\n");
     let _ = monitor_out.flush();
     Ok(())

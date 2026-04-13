@@ -2,9 +2,8 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use common::DataType;
 use db_config::table::ColumnSpec;
-use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub enum Value {
     Int32(i32),
     Int64(i64),
@@ -54,7 +53,7 @@ impl fmt::Display for Value {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Row {
     pub values: Vec<Value>,
 }
@@ -68,6 +67,111 @@ impl Row {
         }
         s.push_str("\n");
         s
+    }
+}
+
+impl Value {
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::Int32(_) | Self::Float32(_) => 1 + 4,
+            Self::Int64(_) | Self::Float64(_) => 1 + 8,
+            Self::String(v) => 1 + 4 + v.len(),
+        }
+    }
+
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Int32(v) => {
+                out.push(1);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Self::Int64(v) => {
+                out.push(2);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Self::Float32(v) => {
+                out.push(3);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Self::Float64(v) => {
+                out.push(4);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Self::String(v) => {
+                out.push(5);
+                let len = u32::try_from(v.len()).expect("Row string too large to encode");
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(v.as_bytes());
+            }
+        }
+    }
+
+    fn decode_from(input: &[u8], offset: &mut usize) -> Option<Self> {
+        let tag = *input.get(*offset)?;
+        *offset += 1;
+
+        match tag {
+            1 => {
+                let bytes: [u8; 4] = input.get(*offset..*offset + 4)?.try_into().ok()?;
+                *offset += 4;
+                Some(Self::Int32(i32::from_le_bytes(bytes)))
+            }
+            2 => {
+                let bytes: [u8; 8] = input.get(*offset..*offset + 8)?.try_into().ok()?;
+                *offset += 8;
+                Some(Self::Int64(i64::from_le_bytes(bytes)))
+            }
+            3 => {
+                let bytes: [u8; 4] = input.get(*offset..*offset + 4)?.try_into().ok()?;
+                *offset += 4;
+                Some(Self::Float32(f32::from_le_bytes(bytes)))
+            }
+            4 => {
+                let bytes: [u8; 8] = input.get(*offset..*offset + 8)?.try_into().ok()?;
+                *offset += 8;
+                Some(Self::Float64(f64::from_le_bytes(bytes)))
+            }
+            5 => {
+                let len_bytes: [u8; 4] = input.get(*offset..*offset + 4)?.try_into().ok()?;
+                *offset += 4;
+                let len = u32::from_le_bytes(len_bytes) as usize;
+                let bytes = input.get(*offset..*offset + len)?;
+                *offset += len;
+                let value = String::from_utf8(bytes.to_vec()).ok()?;
+                Some(Self::String(value))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Row {
+    pub fn encode(&self) -> Vec<u8> {
+        let values_len = u32::try_from(self.values.len()).expect("Too many values in row");
+        let capacity = 4 + self.values.iter().map(Value::encoded_len).sum::<usize>();
+        let mut out = Vec::with_capacity(capacity);
+        out.extend_from_slice(&values_len.to_le_bytes());
+        for value in &self.values {
+            value.encode_into(&mut out);
+        }
+        out
+    }
+
+    pub fn decode(input: &[u8]) -> Option<Self> {
+        let count_bytes: [u8; 4] = input.get(..4)?.try_into().ok()?;
+        let count = u32::from_le_bytes(count_bytes) as usize;
+        let mut values = Vec::with_capacity(count);
+        let mut offset = 4;
+
+        for _ in 0..count {
+            values.push(Value::decode_from(input, &mut offset)?);
+        }
+
+        if offset == input.len() {
+            Some(Self { values })
+        } else {
+            None
+        }
     }
 }
 

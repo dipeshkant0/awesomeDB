@@ -35,7 +35,7 @@ impl<'a, R: Read, W: Write> ScratchRunWriter<'a, R, W> {
     }
 
     fn write_row(&mut self, row: &Row) {
-        let encoded = bincode::serialize(row).expect("External Sort: Failed to serialize row");
+        let encoded = row.encode();
         let row_len = u32::try_from(encoded.len()).expect("External Sort: Row too large to spill");
         self.write_bytes(&row_len.to_le_bytes());
         self.write_bytes(&encoded);
@@ -110,7 +110,7 @@ impl<'a, R: Read, W: Write> ScratchRunReader<'a, R, W> {
         let len_bytes = self.read_exact(4)?;
         let row_len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
         let row_bytes = self.read_exact(row_len)?;
-        bincode::deserialize(&row_bytes).ok()
+        Row::decode(&row_bytes)
     }
 
     fn read_exact(&mut self, len: usize) -> Option<Vec<u8>> {

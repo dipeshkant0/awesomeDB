@@ -179,15 +179,11 @@ pub fn deserialize_block(data: &[u8], columns: &[ColumnSpec]) -> Vec<Row> {
     let mut rows = Vec::new();
     if data.len() < 2 { return rows; }
 
-    let map_capacity = data.len();
+    let map_capacity = data.len() - 2;
+    let row_count = u16::from_le_bytes([data[map_capacity], data[map_capacity + 1]]) as usize;
     let mut offset = 0;
 
-    while offset < map_capacity {
-    
-        if offset + 8 <= map_capacity && data[offset..offset+8].iter().all(|&b| b == 0) {
-            break;
-        }
-
+    for _ in 0..row_count {
         let mut values = Vec::new();
         let mut row_valid = true;
 
@@ -233,9 +229,148 @@ pub fn deserialize_block(data: &[u8], columns: &[ColumnSpec]) -> Vec<Row> {
         if row_valid && values.len() == columns.len() {
             rows.push(Row { values });
         } else {
-            break; 
+            break;
         }
     }
     
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Row, Value, deserialize_block};
+    use common::DataType;
+    use db_config::table::ColumnSpec;
+
+    fn col(name: &str, data_type: DataType) -> ColumnSpec {
+        ColumnSpec {
+            column_name: name.to_string(),
+            data_type,
+            stats: None,
+        }
+    }
+
+    fn encode_block(rows: &[Row], block_size: usize) -> Vec<u8> {
+        let mut block = vec![0u8; block_size];
+        let map_capacity = block_size - 2;
+        let mut offset = 0usize;
+
+        for row in rows {
+            for value in &row.values {
+                match value {
+                    Value::Int32(v) => {
+                        block[offset..offset + 4].copy_from_slice(&v.to_le_bytes());
+                        offset += 4;
+                    }
+                    Value::Int64(v) => {
+                        block[offset..offset + 8].copy_from_slice(&v.to_le_bytes());
+                        offset += 8;
+                    }
+                    Value::Float32(v) => {
+                        block[offset..offset + 4].copy_from_slice(&v.to_le_bytes());
+                        offset += 4;
+                    }
+                    Value::Float64(v) => {
+                        block[offset..offset + 8].copy_from_slice(&v.to_le_bytes());
+                        offset += 8;
+                    }
+                    Value::String(v) => {
+                        let bytes = v.as_bytes();
+                        block[offset..offset + bytes.len()].copy_from_slice(bytes);
+                        offset += bytes.len();
+                        block[offset] = 0;
+                        offset += 1;
+                    }
+                }
+            }
+        }
+
+        block[map_capacity..].copy_from_slice(&(rows.len() as u16).to_le_bytes());
+
+        block
+    }
+
+    #[test]
+    fn row_roundtrip_handles_mixed_values() {
+        let row = Row {
+            values: vec![
+                Value::Int32(7),
+                Value::Int64(0),
+                Value::Float32(3.5),
+                Value::Float64(-9.25),
+                Value::String(String::new()),
+                Value::String("alpha beta".to_string()),
+            ],
+        };
+
+        let encoded = row.encode();
+        let decoded = Row::decode(&encoded).expect("row should decode");
+
+        assert_eq!(decoded.values.len(), row.values.len());
+        for (lhs, rhs) in decoded.values.iter().zip(row.values.iter()) {
+            assert_eq!(lhs, rhs);
+        }
+    }
+
+    #[test]
+    fn deserialize_block_keeps_rows_that_start_with_zero_bytes() {
+        let columns = vec![
+            col("id64", DataType::Int64),
+            col("name", DataType::String),
+        ];
+        let rows = vec![
+            Row {
+                values: vec![Value::Int64(0), Value::String("zero-row".to_string())],
+            },
+            Row {
+                values: vec![Value::Int64(5), Value::String("next-row".to_string())],
+            },
+        ];
+        let block = encode_block(&rows, 128);
+
+        let decoded = deserialize_block(&block, &columns);
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].values[0], Value::Int64(0));
+        assert_eq!(decoded[0].values[1], Value::String("zero-row".to_string()));
+        assert_eq!(decoded[1].values[0], Value::Int64(5));
+        assert_eq!(decoded[1].values[1], Value::String("next-row".to_string()));
+    }
+
+    #[test]
+    fn deserialize_block_ignores_padding_after_last_row() {
+        let columns = vec![
+            col("id32", DataType::Int32),
+            col("name", DataType::String),
+            col("region32", DataType::Int32),
+        ];
+        let rows = vec![
+            Row {
+                values: vec![
+                    Value::Int32(1),
+                    Value::String("alpha".to_string()),
+                    Value::Int32(7),
+                ],
+            },
+            Row {
+                values: vec![
+                    Value::Int32(2),
+                    Value::String("beta".to_string()),
+                    Value::Int32(9),
+                ],
+            },
+        ];
+        let mut block = encode_block(&rows, 128);
+
+        // Non-row garbage in unused payload should not be interpreted as another row.
+        block[40] = 1;
+        block[41] = 2;
+        block[42] = 3;
+
+        let decoded = deserialize_block(&block, &columns);
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].values[0], Value::Int32(1));
+        assert_eq!(decoded[1].values[0], Value::Int32(2));
+    }
 }

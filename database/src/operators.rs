@@ -1,10 +1,10 @@
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::io::{Read, Write};
-use std::collections::HashMap;
 use crate::data::{Row, Value};
 use crate::buffer_pool::BufferPoolManager;
 use common::query::{Predicate, ComparisionValue, ComparisionOperator};
 use db_config::table::TableSpec;
-use std::cmp::Ordering;
 
 struct ScratchRun {
     block_ids: Vec<u64>,
@@ -146,6 +146,57 @@ impl<'a, R: Read, W: Write> ScratchRunReader<'a, R, W> {
             self.loaded = true;
         }
         Some(())
+    }
+}
+
+struct HeapEntry {
+    row: Row,
+    run_idx: usize,
+    sort_indices: Vec<(usize, bool)>,
+}
+
+impl HeapEntry {
+    fn new(row: Row, run_idx: usize, sort_indices: &[(usize, bool)]) -> Self {
+        Self {
+            row,
+            run_idx,
+            sort_indices: sort_indices.to_vec(),
+        }
+    }
+
+    fn compare_rows(sort_indices: &[(usize, bool)], a: &Row, b: &Row) -> Ordering {
+        for &(idx, ascending) in sort_indices {
+            let cmp = a.values[idx].partial_cmp(&b.values[idx]).unwrap_or(Ordering::Equal);
+            if cmp != Ordering::Equal {
+                return if ascending { cmp } else { cmp.reverse() };
+            }
+        }
+        Ordering::Equal
+    }
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.run_idx == other.run_idx
+            && Self::compare_rows(&self.sort_indices, &self.row, &other.row) == Ordering::Equal
+    }
+}
+
+impl Eq for HeapEntry {}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match Self::compare_rows(&self.sort_indices, &self.row, &other.row) {
+            Ordering::Less => Ordering::Greater,
+            Ordering::Greater => Ordering::Less,
+            Ordering::Equal => other.run_idx.cmp(&self.run_idx),
+        }
     }
 }
 
@@ -368,7 +419,7 @@ pub struct SortOperator<'a, R: Read, W: Write> {
     scratch_block_size: usize,
     runs: Vec<ScratchRun>,
     run_readers: Vec<ScratchRunReader<'a, R, W>>,
-    head_rows: Vec<Option<Row>>, // The current top row of each temp file
+    merge_heap: BinaryHeap<HeapEntry>,
 }
 
 impl<'a, R: Read, W: Write> SortOperator<'a, R, W> {
@@ -390,7 +441,7 @@ impl<'a, R: Read, W: Write> SortOperator<'a, R, W> {
             scratch_block_size,
             runs: Vec::new(),
             run_readers: Vec::new(),
-            head_rows: Vec::new(),
+            merge_heap: BinaryHeap::new(),
         }
     }
 
@@ -414,6 +465,63 @@ impl<'a, R: Read, W: Write> SortOperator<'a, R, W> {
             }
         }
         size
+    }
+
+    fn merge_fan_in(&self) -> usize {
+        let per_run_bytes = self.scratch_block_size + 256;
+        let budgeted_runs = self.memory_limit_bytes / per_run_bytes;
+        budgeted_runs.max(2)
+    }
+
+    fn merge_runs_batch(&self, runs: Vec<ScratchRun>) -> ScratchRun {
+        let mut readers = Vec::with_capacity(runs.len());
+        let mut heap = BinaryHeap::new();
+
+        for (run_idx, run) in runs.into_iter().enumerate() {
+            let mut reader = ScratchRunReader::new(
+                self.scratch_pool_ptr,
+                run.block_ids,
+                run.total_bytes,
+                self.scratch_block_size,
+            );
+            if let Some(row) = reader.read_row() {
+                heap.push(HeapEntry::new(row, run_idx, &self.sort_indices));
+            }
+            readers.push(reader);
+        }
+
+        let mut writer = ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size);
+        while let Some(entry) = heap.pop() {
+            writer.write_row(&entry.row);
+            if let Some(next_row) = readers[entry.run_idx].read_row() {
+                heap.push(HeapEntry::new(next_row, entry.run_idx, &self.sort_indices));
+            }
+        }
+
+        writer.finish()
+    }
+
+    fn collapse_runs(&mut self) {
+        let fan_in = self.merge_fan_in();
+        while self.runs.len() > fan_in {
+            let mut merged_runs = Vec::new();
+            let pending_runs = std::mem::take(&mut self.runs);
+            let mut iter = pending_runs.into_iter();
+
+            loop {
+                let chunk: Vec<_> = iter.by_ref().take(fan_in).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                if chunk.len() == 1 {
+                    merged_runs.push(chunk.into_iter().next().unwrap());
+                } else {
+                    merged_runs.push(self.merge_runs_batch(chunk));
+                }
+            }
+
+            self.runs = merged_runs;
+        }
     }
 }
 
@@ -455,6 +563,7 @@ impl<'a, R: Read, W: Write> Operator for SortOperator<'a, R, W> {
             }
 
             if self.is_external {
+                self.collapse_runs();
                 for run in self.runs.drain(..) {
                     let mut reader = ScratchRunReader::new(
                         self.scratch_pool_ptr,
@@ -464,9 +573,9 @@ impl<'a, R: Read, W: Write> Operator for SortOperator<'a, R, W> {
                     );
 
                     if let Some(row) = reader.read_row() {
-                        self.head_rows.push(Some(row));
-                    } else {
-                        self.head_rows.push(None);
+                        let run_idx = self.run_readers.len();
+                        self.merge_heap
+                            .push(HeapEntry::new(row, run_idx, &self.sort_indices));
                     }
                     self.run_readers.push(reader);
                 }
@@ -478,25 +587,12 @@ impl<'a, R: Read, W: Write> Operator for SortOperator<'a, R, W> {
             return self.in_memory_rows.next();
         }
 
-        let mut min_idx = None;
-        for i in 0..self.head_rows.len() {
-            if let Some(ref current_head) = self.head_rows[i] {
-                match min_idx {
-                    None => min_idx = Some(i),
-                    Some(idx) => {
-                        let min_head = self.head_rows[idx].as_ref().unwrap();
-                        if self.compare_rows(current_head, min_head) == Ordering::Less {
-                            min_idx = Some(i);
-                        }
-                    }
-                }
+        if let Some(entry) = self.merge_heap.pop() {
+            if let Some(next_row) = self.run_readers[entry.run_idx].read_row() {
+                self.merge_heap
+                    .push(HeapEntry::new(next_row, entry.run_idx, &self.sort_indices));
             }
-        }
-
-        if let Some(idx) = min_idx {
-            let smallest_row = self.head_rows[idx].take(); 
-            self.head_rows[idx] = self.run_readers[idx].read_row();
-            return smallest_row;
+            return Some(entry.row);
         }
 
         None
@@ -605,7 +701,8 @@ pub struct HashJoinOperator<'a> {
     left_col_idx: usize,
     right_col_idx: usize,
     build_on_left: bool,
-    hash_table: HashMap<Value, Vec<Row>>, 
+    build_rows: Vec<Row>,
+    hash_table: HashMap<Value, Vec<usize>>,
     current_probe_row: Option<Row>,
     current_match_key: Option<Value>,
     current_match_index: usize,
@@ -616,7 +713,7 @@ impl<'a> HashJoinOperator<'a> {
     pub fn new(
         left_child: Box<dyn Operator + 'a>, 
         right_child: Box<dyn Operator + 'a>, 
-        left_col_idx: usize, 
+        left_col_idx: usize,
         right_col_idx: usize,
         build_on_left: bool, 
     ) -> Self {
@@ -626,6 +723,7 @@ impl<'a> HashJoinOperator<'a> {
             left_col_idx,
             right_col_idx,
             build_on_left,
+            build_rows: Vec::new(),
             hash_table: HashMap::new(),
             current_probe_row: None,
             current_match_key: None,
@@ -640,11 +738,13 @@ impl<'a> Operator for HashJoinOperator<'a> {
         if !self.initialized {
             // BUILD PHASE
             let mut build_child = if self.build_on_left { self.left_child.take() } else { self.right_child.take() }.unwrap();
-            let b_idx = if self.build_on_left { self.left_col_idx } else { self.right_col_idx };
+            let build_idx = if self.build_on_left { self.left_col_idx } else { self.right_col_idx };
 
             while let Some(row) = build_child.next() {
-                let key = row.values[b_idx].clone();
-                self.hash_table.entry(key).or_insert_with(Vec::new).push(row);
+                let row_idx = self.build_rows.len();
+                self.build_rows.push(row);
+                let key = self.build_rows[row_idx].values[build_idx].clone();
+                self.hash_table.entry(key).or_insert_with(Vec::new).push(row_idx);
             }
             self.initialized = true;
             
@@ -658,7 +758,7 @@ impl<'a> Operator for HashJoinOperator<'a> {
             if let Some(key) = self.current_match_key.as_ref() {
                 if let Some(build_rows) = self.hash_table.get(key) {
                     if self.current_match_index < build_rows.len() {
-                        let b_row = &build_rows[self.current_match_index];
+                        let b_row = &self.build_rows[build_rows[self.current_match_index]];
                         self.current_match_index += 1;
 
                         let mut vals = Vec::with_capacity(b_row.values.len() + probe_row.values.len());
@@ -680,8 +780,8 @@ impl<'a> Operator for HashJoinOperator<'a> {
                 continue;
             }
 
-            let p_idx = if self.build_on_left { self.right_col_idx } else { self.left_col_idx };
-            let key = probe_row.values[p_idx].clone();
+            let probe_idx = if self.build_on_left { self.right_col_idx } else { self.left_col_idx };
+            let key = probe_row.values[probe_idx].clone();
             let probe_child = if self.build_on_left { self.right_child.as_mut() } else { self.left_child.as_mut() }.unwrap();
 
             if self.hash_table.contains_key(&key) {

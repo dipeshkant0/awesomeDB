@@ -203,6 +203,54 @@ fn estimate_cardinality(op: &QueryOp, ctx: &DbContext) -> f64 {
     }
 }
 
+fn estimate_value_width_bytes(column_name: &str, ctx: &DbContext) -> usize {
+    let base_name = column_name.rsplit('.').next().unwrap_or(column_name);
+    for table in ctx.get_table_specs() {
+        if let Some(col) = table.column_specs.iter().find(|c| c.column_name == base_name) {
+            return match col.data_type {
+                common::DataType::Int32 | common::DataType::Float32 => 8,
+                common::DataType::Int64 | common::DataType::Float64 => 16,
+                common::DataType::String => 48,
+            };
+        }
+    }
+    24
+}
+
+fn estimate_row_width_bytes(op: &QueryOp, ctx: &DbContext) -> usize {
+    match op {
+        QueryOp::Scan(data) => {
+            ctx.get_table_specs()
+                .iter()
+                .find(|t| t.name == data.table_id)
+                .map(|t| {
+                    t.column_specs
+                        .iter()
+                        .map(|c| estimate_value_width_bytes(&c.column_name, ctx))
+                        .sum::<usize>()
+                })
+                .unwrap_or(64)
+        }
+        QueryOp::Filter(data) => estimate_row_width_bytes(&data.underlying, ctx),
+        QueryOp::Sort(data) => estimate_row_width_bytes(&data.underlying, ctx),
+        QueryOp::Project(data) => data
+            .column_name_map
+            .iter()
+            .map(|(_, src)| estimate_value_width_bytes(src, ctx))
+            .sum(),
+        QueryOp::Cross(data) => {
+            estimate_row_width_bytes(&data.left, ctx) + estimate_row_width_bytes(&data.right, ctx)
+        }
+    }
+}
+
+fn estimated_bytes_for_op(op: &QueryOp, ctx: &DbContext) -> usize {
+    let rows = estimate_cardinality(op, ctx).max(1.0);
+    let width = estimate_row_width_bytes(op, ctx).max(1);
+    let bytes = rows * width as f64 * 2.0;
+    bytes.min(usize::MAX as f64) as usize
+}
+
 fn flatten_cross(op: QueryOp, out: &mut Vec<QueryOp>) {
     match op {
         QueryOp::Cross(data) => {
@@ -609,14 +657,14 @@ fn build_pipeline<'a, R: Read, W: Write>(
                 let left_schema = get_output_schema(&cross_data.left, ctx);
                 let right_schema = get_output_schema(&cross_data.right, ctx);
 
-                // Only intercept if the condition spans both sides
+                // Only intercept if the condition spans both sides.
                 let mut join_pred_idx = None;
                 for (i, pred) in data.predicates.iter().enumerate() {
                     if matches!(pred.operator, common::query::ComparisionOperator::EQ) {
                         if let common::query::ComparisionValue::Column(ref rhs_col) = pred.value {
                             let is_bridge = (left_schema.contains_key(&pred.column_name) && right_schema.contains_key(rhs_col)) ||
                                             (left_schema.contains_key(rhs_col) && right_schema.contains_key(&pred.column_name));
-                            
+
                             if is_bridge {
                                 join_pred_idx = Some((i, pred.column_name.clone(), rhs_col.clone()));
                                 break;
@@ -635,17 +683,39 @@ fn build_pipeline<'a, R: Read, W: Write>(
                     let left_est = estimate_cardinality(&cross_data.left, ctx);
                     let right_est = estimate_cardinality(&cross_data.right, ctx);
                     let build_on_left = left_est < right_est;
+                    let estimated_build_bytes = if build_on_left {
+                        estimated_bytes_for_op(&cross_data.left, ctx)
+                    } else {
+                        estimated_bytes_for_op(&cross_data.right, ctx)
+                    };
+
+                    // Hash join has no spill path. Use a conservative but realistic threshold:
+                    // sort_memory_limit_bytes is only the external-sort budget, not the whole process budget.
+                    let hash_join_memory_budget = sort_memory_limit_bytes.saturating_mul(3);
+                    if estimated_build_bytes > hash_join_memory_budget {
+                        data.underlying = Box::new(QueryOp::Cross(cross_data));
+                        let schema = get_output_schema(&data.underlying, ctx);
+                        return Box::new(FilterOperator::new(
+                            build_pipeline(*data.underlying, ctx, pool, sort_memory_limit_bytes),
+                            data.predicates,
+                            schema,
+                        ));
+                    }
 
                     let pool_ptr = pool as *mut buffer_pool::BufferPoolManager<R, W>;
                     let left_child = build_pipeline(*cross_data.left, ctx, pool, sort_memory_limit_bytes);
                     let right_child = build_pipeline(*cross_data.right, ctx, unsafe { &mut *pool_ptr }, sort_memory_limit_bytes);
 
                     let hash_join = Box::new(HashJoinOperator::new(
-                        left_child, right_child, left_col_idx, right_col_idx, build_on_left
+                        left_child,
+                        right_child,
+                        left_col_idx,
+                        right_col_idx,
+                        build_on_left,
                     ));
 
                     data.predicates.remove(idx);
-                    
+
                     if data.predicates.is_empty() {
                         return hash_join; 
                     } else {

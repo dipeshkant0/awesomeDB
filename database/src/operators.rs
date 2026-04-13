@@ -7,7 +7,6 @@ use common::query::{Predicate, ComparisionValue, ComparisionOperator};
 use db_config::table::TableSpec;
 use std::hash::{BuildHasherDefault, Hasher, Hash};
 
-
 pub struct Fnv1aHasher(u64);
 
 impl Default for Fnv1aHasher {
@@ -26,12 +25,10 @@ impl Hasher for Fnv1aHasher {
 
 pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<Fnv1aHasher>>;
 
-
 struct ScratchRun {
     block_ids: Vec<u64>,
     total_bytes: usize,
 }
-
 
 struct ScratchRunWriter<'a, R: Read, W: Write> {
     pool_ptr: *mut BufferPoolManager<R, W>,
@@ -114,6 +111,10 @@ impl<'a, R: Read, W: Write> ScratchRunReader<'a, R, W> {
         Self { pool_ptr, block_ids, total_bytes, bytes_read: 0, block_idx: 0, current_block: vec![0; block_size], offset: 0, loaded: false, free_on_drop, _marker: std::marker::PhantomData }
     }
 
+    pub fn has_more(&self) -> bool {
+        self.bytes_read < self.total_bytes
+    }
+
     fn read_row(&mut self) -> Option<Row> {
         if self.bytes_read >= self.total_bytes { return None; }
         let len_bytes = self.read_exact(4)?;
@@ -143,8 +144,9 @@ impl<'a, R: Read, W: Write> ScratchRunReader<'a, R, W> {
         if !self.loaded || self.offset == self.current_block.len() {
             let start_block_id = *self.block_ids.get(self.block_idx)?;
 
+            // Cap reads at 4 blocks (16 KB) to completely prevent OOM 
             let mut num_blocks = 1;
-            while self.block_idx + num_blocks < self.block_ids.len() && num_blocks < 16 {
+            while self.block_idx + num_blocks < self.block_ids.len() && num_blocks < 4 {
                 if self.block_ids[self.block_idx + num_blocks] == start_block_id + (num_blocks as u64) {
                     num_blocks += 1;
                 } else {
@@ -214,7 +216,7 @@ impl Ord for HeapEntry {
 
 pub trait Operator { fn next(&mut self) -> Option<Row>; }
 
-
+//Scan
 pub struct ScanOperator<'a, R: Read, W: Write> {
     table_spec: &'a TableSpec,
     buffer_pool: &'a mut BufferPoolManager<R, W>,
@@ -268,7 +270,7 @@ impl<'a, R: Read, W: Write> Operator for ScanOperator<'a, R, W> {
     }
 }
 
-//Filter operator
+//Filter
 pub struct FilterOperator<'a> {
     child: Box<dyn Operator + 'a>,
     predicates: Vec<CompiledPredicate>,
@@ -373,7 +375,7 @@ fn evaluate_predicate(row: &Row, predicate: &CompiledPredicate) -> bool {
     }
 }
 
-//project operator
+//Projection
 pub struct ProjectOperator<'a> {
     child: Box<dyn Operator + 'a>,
     column_indices: Vec<usize>,
@@ -394,7 +396,7 @@ impl<'a> Operator for ProjectOperator<'a> {
     }
 }
 
-//sort operator
+//Sort Operator
 pub struct SortOperator<'a, R: Read, W: Write> {
     child: Box<dyn Operator + 'a>,
     sort_indices: Vec<(usize, bool)>, 
@@ -425,9 +427,7 @@ impl<'a, R: Read, W: Write> SortOperator<'a, R, W> {
     }
 
     fn merge_fan_in(&self) -> usize {
-        let per_run_bytes = self.scratch_block_size + 256;
-        let budgeted_runs = self.memory_limit_bytes / per_run_bytes;
-        budgeted_runs.max(2)
+        128
     }
 
     fn merge_runs_batch(&self, runs: Vec<ScratchRun>) -> ScratchRun {
@@ -438,7 +438,6 @@ impl<'a, R: Read, W: Write> SortOperator<'a, R, W> {
             if let Some(row) = reader.read_row() { heap.push(HeapEntry::new(row, run_idx, &self.sort_indices)); }
             readers.push(reader);
         }
-        // Use 16-block buffers for Sorting 
         let mut writer = ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size, 16);
         while let Some(mut top_entry) = heap.peek_mut() {
             writer.write_row(&top_entry.row);
@@ -481,7 +480,6 @@ impl<'a, R: Read, W: Write> Operator for SortOperator<'a, R, W> {
                 if current_memory >= self.memory_limit_bytes {
                     self.is_external = true;
                     current_run.sort_by(|a, b| HeapEntry::compare_rows(&self.sort_indices, a, b));
-                    // Safe 16-block writer
                     let mut writer = ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size, 16);
                     for r in &current_run { writer.write_row(r); }
                     self.runs.push(writer.finish());
@@ -531,7 +529,7 @@ impl<'a, R: Read, W: Write> Operator for SortOperator<'a, R, W> {
     }
 }
 
-
+//Block Nested Loop Join 
 pub struct CrossOperator<'a, R: Read, W: Write> {
     left_child: Option<Box<dyn Operator + 'a>>,
     right_child: Option<Box<dyn Operator + 'a>>,
@@ -598,7 +596,6 @@ impl<'a, R: Read, W: Write> Operator for CrossOperator<'a, R, W> {
             if self.stream_chunk.is_empty() {
                 if self.stream_exhausted { return None; }
                 
-                // Load up to 2MB of streaming rows at once
                 let mut chunk_bytes = 0;
                 let stream = if self.materialize_left { self.right_child.as_mut().unwrap() } else { self.left_child.as_mut().unwrap() };
                 
@@ -614,7 +611,6 @@ impl<'a, R: Read, W: Write> Operator for CrossOperator<'a, R, W> {
                 
                 if self.stream_chunk.is_empty() { return None; }
                 
-                // Rewind the spilled disk run
                 let run_ref = self.spilled_run.as_ref().unwrap();
                 self.current_reader = Some(ScratchRunReader::new(self.scratch_pool_ptr, run_ref.block_ids.clone(), run_ref.total_bytes, self.scratch_block_size, false));
                 self.current_spilled_row = self.current_reader.as_mut().unwrap().read_row();
@@ -636,90 +632,13 @@ impl<'a, R: Read, W: Write> Operator for CrossOperator<'a, R, W> {
                     self.current_spilled_row = self.current_reader.as_mut().unwrap().read_row();
                 }
             } else {
-                // Done with this disk pass, clear chunk to fetch the next streaming batch
                 self.stream_chunk.clear();
             }
         }
     }
 }
 
-pub struct HashJoinOperator<'a> {
-    left_child: Option<Box<dyn Operator + 'a>>,
-    right_child: Option<Box<dyn Operator + 'a>>,
-    left_col_idx: usize,
-    right_col_idx: usize,
-    build_on_left: bool,
-    build_rows: Vec<Row>,
-    hash_table: FastMap<Value, Vec<usize>>,
-    current_probe_row: Option<Row>,
-    current_match_key: Option<Value>,
-    current_match_index: usize,
-    initialized: bool,
-}
-
-impl<'a> HashJoinOperator<'a> {
-    pub fn new(left_child: Box<dyn Operator + 'a>, right_child: Box<dyn Operator + 'a>, left_col_idx: usize, right_col_idx: usize, build_on_left: bool) -> Self {
-        Self { left_child: Some(left_child), right_child: Some(right_child), left_col_idx, right_col_idx, build_on_left, build_rows: Vec::new(), hash_table: FastMap::default(), current_probe_row: None, current_match_key: None, current_match_index: 0, initialized: false }
-    }
-}
-
-impl<'a> Operator for HashJoinOperator<'a> {
-    fn next(&mut self) -> Option<Row> {
-        if !self.initialized {
-            let mut build_child = if self.build_on_left { self.left_child.take() } else { self.right_child.take() }.unwrap();
-            let build_idx = if self.build_on_left { self.left_col_idx } else { self.right_col_idx };
-
-            while let Some(row) = build_child.next() {
-                let row_idx = self.build_rows.len();
-                self.build_rows.push(row);
-                let key = self.build_rows[row_idx].values[build_idx].clone();
-                self.hash_table.entry(key).or_insert_with(Vec::new).push(row_idx);
-            }
-            self.initialized = true;
-            
-            let probe_child = if self.build_on_left { self.right_child.as_mut() } else { self.left_child.as_mut() }.unwrap();
-            self.current_probe_row = probe_child.next();
-        }
-
-        loop {
-            let probe_row = self.current_probe_row.as_ref()?;
-
-            if let Some(key) = self.current_match_key.as_ref() {
-                if let Some(build_rows) = self.hash_table.get(key) {
-                    if self.current_match_index < build_rows.len() {
-                        let b_row = &self.build_rows[build_rows[self.current_match_index]];
-                        self.current_match_index += 1;
-
-                        let (left_row, right_row) = if self.build_on_left {
-                            (b_row, probe_row)
-                        } else {
-                            (probe_row, b_row)
-                        };
-                        return Some(Row::combine(left_row, right_row));
-                    }
-                }
-
-                let probe_child = if self.build_on_left { self.right_child.as_mut() } else { self.left_child.as_mut() }.unwrap();
-                self.current_probe_row = probe_child.next();
-                self.current_match_key = None;
-                self.current_match_index = 0;
-                continue;
-            }
-
-            let probe_idx = if self.build_on_left { self.right_col_idx } else { self.left_col_idx };
-            let key = probe_row.values[probe_idx].clone();
-            let probe_child = if self.build_on_left { self.right_child.as_mut() } else { self.left_child.as_mut() }.unwrap();
-
-            if self.hash_table.contains_key(&key) {
-                self.current_match_key = Some(key);
-                self.current_match_index = 0;
-            } else {
-                self.current_probe_row = probe_child.next();
-            }
-        }
-    }
-}
-
+// Grace Hash Join
 #[derive(PartialEq)]
 enum JoinState {
     Partitioning,
@@ -743,6 +662,8 @@ pub struct GraceHashJoinOperator<'a, R: Read, W: Write> {
     in_memory_hash_table: FastMap<Value, Vec<usize>>,
     in_memory_build_rows: Vec<Row>,
 
+    current_build_reader: Option<ScratchRunReader<'a, R, W>>,
+    current_probe_run: Option<ScratchRun>,
     current_probe_reader: Option<ScratchRunReader<'a, R, W>>,
     current_probe_row: Option<Row>,
     current_match_key: Option<Value>,
@@ -761,6 +682,7 @@ impl<'a, R: Read, W: Write> GraceHashJoinOperator<'a, R, W> {
             build_on_left, num_partitions, scratch_pool_ptr, scratch_block_size, 
             build_partitions: Vec::new(), probe_partitions: Vec::new(), 
             in_memory_hash_table: FastMap::default(), in_memory_build_rows: Vec::new(),
+            current_build_reader: None, current_probe_run: None,
             current_probe_reader: None, current_probe_row: None, current_match_key: None, 
             current_match_index: 0, state: JoinState::Partitioning 
         }
@@ -773,6 +695,21 @@ impl<'a, R: Read, W: Write> GraceHashJoinOperator<'a, R, W> {
     }
 }
 
+impl<'a, R: Read, W: Write> Drop for GraceHashJoinOperator<'a, R, W> {
+    fn drop(&mut self) {
+        let pool = unsafe { &mut *self.scratch_pool_ptr };
+        for run in &self.build_partitions {
+            for &id in &run.block_ids { pool.disk_manager.free_anon_block(id); }
+        }
+        for run in &self.probe_partitions {
+            for &id in &run.block_ids { pool.disk_manager.free_anon_block(id); }
+        }
+        if let Some(run) = &self.current_probe_run {
+            for &id in &run.block_ids { pool.disk_manager.free_anon_block(id); }
+        }
+    }
+}
+
 impl<'a, R: Read, W: Write> Operator for GraceHashJoinOperator<'a, R, W> {
     fn next(&mut self) -> Option<Row> {
         loop {
@@ -781,9 +718,8 @@ impl<'a, R: Read, W: Write> Operator for GraceHashJoinOperator<'a, R, W> {
                     let mut build_writers = Vec::with_capacity(self.num_partitions);
                     let mut probe_writers = Vec::with_capacity(self.num_partitions);
                     for _ in 0..self.num_partitions {
-                        // FIX: Use tiny 2-block buffers (8 KB) to prevent 128 partitions from triggering OOM
-                        build_writers.push(ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size, 2));
-                        probe_writers.push(ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size, 2));
+                        build_writers.push(ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size, 4));
+                        probe_writers.push(ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size, 4));
                     }
                     
                     let mut build_child = if self.build_on_left { self.left_child.take() } else { self.right_child.take() }.unwrap();
@@ -806,27 +742,46 @@ impl<'a, R: Read, W: Write> Operator for GraceHashJoinOperator<'a, R, W> {
                 }
                 
                 JoinState::LoadingBuild => {
-                    if self.build_partitions.is_empty() {
-                        self.state = JoinState::Done;
-                        return None;
+                    if self.current_build_reader.is_none() {
+                        if self.build_partitions.is_empty() {
+                            self.state = JoinState::Done;
+                            return None;
+                        }
+                        
+                        let build_run = self.build_partitions.remove(0); 
+                        self.current_build_reader = Some(ScratchRunReader::new(self.scratch_pool_ptr, build_run.block_ids, build_run.total_bytes, self.scratch_block_size, true));
+                        self.current_probe_run = Some(self.probe_partitions.remove(0));
                     }
 
                     self.in_memory_hash_table.clear();
                     self.in_memory_build_rows.clear();
                     
-                    let build_run = self.build_partitions.remove(0); 
-                    let mut reader = ScratchRunReader::new(self.scratch_pool_ptr, build_run.block_ids, build_run.total_bytes, self.scratch_block_size, true);
-                    
+                    let mut current_memory = 0;
                     let build_idx = if self.build_on_left { self.left_col_idx } else { self.right_col_idx };
-                    while let Some(row) = reader.read_row() {
+                    
+                    let build_reader = self.current_build_reader.as_mut().unwrap();
+
+                    while let Some(row) = build_reader.read_row() {
                         let key = row.values[build_idx].clone();
                         let row_idx = self.in_memory_build_rows.len();
+                        
+                        let mut size = 64; 
+                        for v in &row.values {
+                            if let Value::String(s) = v { size += s.len(); }
+                        }
+                        current_memory += size;
+                        
                         self.in_memory_build_rows.push(row);
                         self.in_memory_hash_table.entry(key).or_insert_with(Vec::new).push(row_idx);
+                        
+                        if current_memory > 12 * 1024 * 1024 {
+                            break;
+                        }
                     }
                     
-                    let probe_run = self.probe_partitions.remove(0);
-                    self.current_probe_reader = Some(ScratchRunReader::new(self.scratch_pool_ptr, probe_run.block_ids, probe_run.total_bytes, self.scratch_block_size, true));
+                    let probe_run = self.current_probe_run.as_ref().unwrap();
+                    
+                    self.current_probe_reader = Some(ScratchRunReader::new(self.scratch_pool_ptr, probe_run.block_ids.clone(), probe_run.total_bytes, self.scratch_block_size, false));
                     self.current_probe_row = self.current_probe_reader.as_mut().unwrap().read_row();
                     self.state = JoinState::Probing;
                 }
@@ -834,7 +789,22 @@ impl<'a, R: Read, W: Write> Operator for GraceHashJoinOperator<'a, R, W> {
                 JoinState::Probing => {
                     if self.current_probe_row.is_none() {
                         self.current_probe_reader = None; 
-                        self.state = JoinState::LoadingBuild;
+                        
+                        let build_reader = self.current_build_reader.as_ref().unwrap();
+                        if build_reader.has_more() {
+                            self.state = JoinState::LoadingBuild;
+                        } else {
+                            self.current_build_reader = None; 
+                            
+                            if let Some(run) = self.current_probe_run.take() {
+                                let pool = unsafe { &mut *self.scratch_pool_ptr };
+                                for &id in &run.block_ids {
+                                    pool.disk_manager.free_anon_block(id);
+                                }
+                            }
+                            
+                            self.state = JoinState::LoadingBuild;
+                        }
                         continue;
                     }
                     

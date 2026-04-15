@@ -47,7 +47,6 @@ fn setup_db_process(
     disk_outbound_reader: PipeReader,
     disk_inbound_writer: PipeWriter,
 ) -> Result<(Child, PipeReader, PipeWriter)> {
-    
     let (monitor_to_db_reader, monitor_to_db_writer) = pipe()?;
     let (db_to_monitor_reader, db_to_monitor_writer) = pipe()?;
 

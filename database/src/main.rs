@@ -1,20 +1,22 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use common::query::{Query, QueryOp}; 
+use common::query::{Query, QueryOp};
 use db_config::DbContext;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 
-mod cli;
-mod io_setup;
 mod buffer_pool;
+mod cli;
 mod data;
+mod io_setup;
 mod operators;
 
 use crate::{
     cli::CliOptions,
     io_setup::{setup_disk_io, setup_monitor_io},
-    operators::{Operator, ScanOperator, FilterOperator, ProjectOperator, SortOperator, CrossOperator, GraceHashJoinOperator},
+    operators::{
+        CrossOperator, FilterOperator, Operator, ProjectOperator, ScanOperator, SortOperator,
+    },
 };
 
 fn resolve_project_mapping<'a>(
@@ -28,7 +30,11 @@ fn get_output_schema(op_node: &QueryOp, ctx: &DbContext) -> HashMap<String, usiz
     match op_node {
         QueryOp::Scan(data) => {
             let mut map = HashMap::new();
-            let spec = ctx.get_table_specs().iter().find(|t| t.name == data.table_id).unwrap();
+            let spec = ctx
+                .get_table_specs()
+                .iter()
+                .find(|t| t.name == data.table_id)
+                .unwrap();
             for (i, col) in spec.column_specs.iter().enumerate() {
                 map.insert(col.column_name.clone(), i);
             }
@@ -41,7 +47,7 @@ fn get_output_schema(op_node: &QueryOp, ctx: &DbContext) -> HashMap<String, usiz
             let mut map = HashMap::new();
             for (i, mapping) in data.column_name_map.iter().enumerate() {
                 let (out_name, _src_name) = resolve_project_mapping(mapping, &child_schema);
-                map.insert(out_name.clone(), i); 
+                map.insert(out_name.clone(), i);
             }
             map
         }
@@ -99,12 +105,16 @@ fn comp_val_as_f64(val: &common::query::ComparisionValue) -> Option<f64> {
 }
 
 fn calculate_selectivity(predicate: &common::query::Predicate, ctx: &DbContext) -> f64 {
-    use db_config::statistics::ColumnStat;
     use common::query::ComparisionOperator;
+    use db_config::statistics::ColumnStat;
 
     let mut column_stats = None;
     for table in ctx.get_table_specs() {
-        if let Some(col) = table.column_specs.iter().find(|c| c.column_name == predicate.column_name) {
+        if let Some(col) = table
+            .column_specs
+            .iter()
+            .find(|c| c.column_name == predicate.column_name)
+        {
             column_stats = col.stats.as_ref();
             break;
         }
@@ -112,10 +122,14 @@ fn calculate_selectivity(predicate: &common::query::Predicate, ctx: &DbContext) 
 
     let default_eq = 0.1;
     let default_range = 0.33;
-
     let stats = match column_stats {
         Some(s) => s,
-        None => return match predicate.operator { ComparisionOperator::EQ => default_eq, _ => default_range },
+        None => {
+            return match predicate.operator {
+                ComparisionOperator::EQ => default_eq,
+                _ => default_range,
+            };
+        }
     };
 
     match predicate.operator {
@@ -145,10 +159,12 @@ fn calculate_selectivity(predicate: &common::query::Predicate, ctx: &DbContext) 
             }
             0.9
         }
-        ComparisionOperator::GT | ComparisionOperator::GTE | ComparisionOperator::LT | ComparisionOperator::LTE => {
+        ComparisionOperator::GT
+        | ComparisionOperator::GTE
+        | ComparisionOperator::LT
+        | ComparisionOperator::LTE => {
             let mut min_val = None;
             let mut max_val = None;
-            
             for stat in stats {
                 if let ColumnStat::RangeStat(range) = stat {
                     min_val = stat_data_as_f64(&range.lower_bound);
@@ -156,10 +172,12 @@ fn calculate_selectivity(predicate: &common::query::Predicate, ctx: &DbContext) 
                     break;
                 }
             }
-
-            if let (Some(min), Some(max), Some(val)) = (min_val, max_val, comp_val_as_f64(&predicate.value)) {
-                if max <= min { return default_range; } 
-                
+            if let (Some(min), Some(max), Some(val)) =
+                (min_val, max_val, comp_val_as_f64(&predicate.value))
+            {
+                if max <= min {
+                    return default_range;
+                }
                 let fraction = match predicate.operator {
                     ComparisionOperator::GT | ComparisionOperator::GTE => (max - val) / (max - min),
                     ComparisionOperator::LT | ComparisionOperator::LTE => (val - min) / (max - min),
@@ -182,10 +200,11 @@ fn estimate_cardinality(op: &QueryOp, ctx: &DbContext) -> f64 {
             for p in &data.predicates {
                 combined_selectivity *= calculate_selectivity(p, ctx);
             }
-            let safe_selectivity = combined_selectivity.max(0.05); 
-            child_est * safe_selectivity
+            child_est * combined_selectivity.max(0.05)
         }
-        QueryOp::Cross(data) => estimate_cardinality(&data.left, ctx) * estimate_cardinality(&data.right, ctx),
+        QueryOp::Cross(data) => {
+            estimate_cardinality(&data.left, ctx) * estimate_cardinality(&data.right, ctx)
+        }
         QueryOp::Project(data) => estimate_cardinality(&data.underlying, ctx),
         QueryOp::Sort(data) => estimate_cardinality(&data.underlying, ctx),
     }
@@ -218,7 +237,6 @@ fn predicate_connects_schemas(
 ) -> bool {
     let lhs_in_current = current_schema.contains_key(&pred.column_name);
     let lhs_in_candidate = candidate_schema.contains_key(&pred.column_name);
-
     match &pred.value {
         common::query::ComparisionValue::Column(rhs_col) => {
             let rhs_in_current = current_schema.contains_key(rhs_col);
@@ -230,7 +248,9 @@ fn predicate_connects_schemas(
 }
 
 fn has_join_predicates(predicates: &[common::query::Predicate]) -> bool {
-    predicates.iter().any(|pred| matches!(pred.value, common::query::ComparisionValue::Column(_)))
+    predicates
+        .iter()
+        .any(|pred| matches!(pred.value, common::query::ComparisionValue::Column(_)))
 }
 
 fn reorder_cross_branches(
@@ -240,14 +260,12 @@ fn reorder_cross_branches(
 ) -> common::query::CrossData {
     let mut branches = Vec::new();
     flatten_cross(QueryOp::Cross(cross_data), &mut branches);
-
     if branches.len() <= 2 {
         if let QueryOp::Cross(data) = build_left_deep_cross(branches) {
             return data;
         }
         unreachable!();
     }
-
     let mut remaining: Vec<(QueryOp, HashMap<String, usize>, f64)> = branches
         .into_iter()
         .map(|branch| {
@@ -256,14 +274,12 @@ fn reorder_cross_branches(
             (branch, schema, est)
         })
         .collect();
-
     let start_idx = remaining
         .iter()
         .enumerate()
         .min_by(|(_, a), (_, b)| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(idx, _)| idx)
         .unwrap();
-
     let (first_branch, first_schema, _) = remaining.remove(start_idx);
     let mut ordered = vec![first_branch];
     let mut current_schema = first_schema;
@@ -283,7 +299,9 @@ fn reorder_cross_branches(
                 remaining
                     .iter()
                     .enumerate()
-                    .min_by(|(_, a), (_, b)| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+                    .min_by(|(_, a), (_, b)| {
+                        a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .map(|(idx, _)| idx)
             })
             .unwrap();
@@ -295,7 +313,6 @@ fn reorder_cross_branches(
         }
         ordered.push(branch);
     }
-
     if let QueryOp::Cross(data) = build_left_deep_cross(ordered) {
         data
     } else {
@@ -313,22 +330,26 @@ fn optimize_ast(op_node: QueryOp, ctx: &DbContext) -> QueryOp {
             match optimized_child {
                 QueryOp::Sort(mut sort_data) => {
                     filter_data.underlying = sort_data.underlying;
-                    sort_data.underlying = Box::new(optimize_ast(QueryOp::Filter(filter_data), ctx));
+                    sort_data.underlying =
+                        Box::new(optimize_ast(QueryOp::Filter(filter_data), ctx));
                     QueryOp::Sort(sort_data)
                 }
                 QueryOp::Project(mut proj_data) => {
                     let child_schema = get_output_schema(&proj_data.underlying, ctx);
                     for pred in &mut filter_data.predicates {
                         for mapping in &proj_data.column_name_map {
-                            let (out_name, src_name) = resolve_project_mapping(mapping, &child_schema);
+                            let (out_name, src_name) =
+                                resolve_project_mapping(mapping, &child_schema);
                             if pred.column_name == *out_name {
                                 pred.column_name = src_name.clone();
                                 break;
                             }
                         }
-                        if let common::query::ComparisionValue::Column(ref mut rhs_col) = pred.value {
+                        if let common::query::ComparisionValue::Column(ref mut rhs_col) = pred.value
+                        {
                             for mapping in &proj_data.column_name_map {
-                                let (out_name, src_name) = resolve_project_mapping(mapping, &child_schema);
+                                let (out_name, src_name) =
+                                    resolve_project_mapping(mapping, &child_schema);
                                 if *rhs_col == *out_name {
                                     *rhs_col = src_name.clone();
                                     break;
@@ -337,11 +358,13 @@ fn optimize_ast(op_node: QueryOp, ctx: &DbContext) -> QueryOp {
                         }
                     }
                     filter_data.underlying = proj_data.underlying;
-                    proj_data.underlying = Box::new(optimize_ast(QueryOp::Filter(filter_data), ctx));
+                    proj_data.underlying =
+                        Box::new(optimize_ast(QueryOp::Filter(filter_data), ctx));
                     QueryOp::Project(proj_data)
                 }
                 QueryOp::Cross(cross_data) => {
-                    let mut cross_data = reorder_cross_branches(cross_data, &filter_data.predicates, ctx);
+                    let mut cross_data =
+                        reorder_cross_branches(cross_data, &filter_data.predicates, ctx);
                     let left_schema = get_output_schema(&cross_data.left, ctx);
                     let right_schema = get_output_schema(&cross_data.right, ctx);
                     let mut left_p = Vec::new();
@@ -351,34 +374,40 @@ fn optimize_ast(op_node: QueryOp, ctx: &DbContext) -> QueryOp {
                     for p in filter_data.predicates {
                         let mut all_in_left = left_schema.contains_key(&p.column_name);
                         let mut all_in_right = right_schema.contains_key(&p.column_name);
-
                         if let common::query::ComparisionValue::Column(ref rhs_col) = p.value {
                             all_in_left = all_in_left && left_schema.contains_key(rhs_col);
                             all_in_right = all_in_right && right_schema.contains_key(rhs_col);
                         }
-
                         if all_in_left {
                             left_p.push(p);
                         } else if all_in_right {
                             right_p.push(p);
                         } else {
-                            keep_p.push(p); 
+                            keep_p.push(p);
                         }
                     }
 
                     if !left_p.is_empty() {
-                        cross_data.left = Box::new(optimize_ast(QueryOp::Filter(common::query::FilterData {
-                            predicates: left_p, underlying: cross_data.left,
-                        }), ctx));
+                        cross_data.left = Box::new(optimize_ast(
+                            QueryOp::Filter(common::query::FilterData {
+                                predicates: left_p,
+                                underlying: cross_data.left,
+                            }),
+                            ctx,
+                        ));
                     }
                     if !right_p.is_empty() {
-                        cross_data.right = Box::new(optimize_ast(QueryOp::Filter(common::query::FilterData {
-                            predicates: right_p, underlying: cross_data.right,
-                        }), ctx));
+                        cross_data.right = Box::new(optimize_ast(
+                            QueryOp::Filter(common::query::FilterData {
+                                predicates: right_p,
+                                underlying: cross_data.right,
+                            }),
+                            ctx,
+                        ));
                     }
 
-                    if keep_p.is_empty() { 
-                        QueryOp::Cross(cross_data) 
+                    if keep_p.is_empty() {
+                        QueryOp::Cross(cross_data)
                     } else {
                         filter_data.predicates = keep_p;
                         filter_data.underlying = Box::new(QueryOp::Cross(cross_data));
@@ -392,26 +421,35 @@ fn optimize_ast(op_node: QueryOp, ctx: &DbContext) -> QueryOp {
             }
         }
 
-       QueryOp::Project(proj_data) => {
+        QueryOp::Project(proj_data) => {
             let proj_child_schema = get_output_schema(&proj_data.underlying, ctx);
             let optimized_child = optimize_ast(*proj_data.underlying, ctx);
             match optimized_child {
+                QueryOp::Scan(scan_data) => QueryOp::Project(common::query::ProjectData {
+                    column_name_map: proj_data.column_name_map,
+                    underlying: Box::new(QueryOp::Scan(scan_data)),
+                }),
                 QueryOp::Sort(mut sort_data) => {
                     let mut new_map = Vec::new();
                     let mut added = std::collections::HashSet::new();
-                    
                     for mapping in &proj_data.column_name_map {
                         let (_, src) = resolve_project_mapping(mapping, &proj_child_schema);
-                        if added.insert(src.clone()) { new_map.push((src.clone(), src.clone())); } 
+                        if added.insert(src.clone()) {
+                            new_map.push((src.clone(), src.clone()));
+                        }
                     }
-                    for s in &sort_data.sort_specs { 
-                        if added.insert(s.column_name.clone()) { new_map.push((s.column_name.clone(), s.column_name.clone())); } 
+                    for s in &sort_data.sort_specs {
+                        if added.insert(s.column_name.clone()) {
+                            new_map.push((s.column_name.clone(), s.column_name.clone()));
+                        }
                     }
-                    
-                    sort_data.underlying = Box::new(optimize_ast(QueryOp::Project(common::query::ProjectData {
-                        column_name_map: new_map, underlying: sort_data.underlying,
-                    }), ctx));
-                    
+                    sort_data.underlying = Box::new(optimize_ast(
+                        QueryOp::Project(common::query::ProjectData {
+                            column_name_map: new_map,
+                            underlying: sort_data.underlying,
+                        }),
+                        ctx,
+                    ));
                     QueryOp::Project(common::query::ProjectData {
                         column_name_map: proj_data.column_name_map,
                         underlying: Box::new(QueryOp::Sort(sort_data)),
@@ -430,24 +468,34 @@ fn optimize_ast(op_node: QueryOp, ctx: &DbContext) -> QueryOp {
                             for mapping in &proj_data.column_name_map {
                                 let (_, src) = resolve_project_mapping(mapping, &proj_child_schema);
                                 if left_schema.contains_key(src) {
-                                    if l_added.insert(src.clone()) { left_map.push((src.clone(), src.clone())); }
+                                    if l_added.insert(src.clone()) {
+                                        left_map.push((src.clone(), src.clone()));
+                                    }
                                 } else if right_schema.contains_key(src) {
-                                    if r_added.insert(src.clone()) { right_map.push((src.clone(), src.clone())); }
+                                    if r_added.insert(src.clone()) {
+                                        right_map.push((src.clone(), src.clone()));
+                                    }
                                 }
                             }
 
                             for pred in &filter_data.predicates {
                                 if left_schema.contains_key(&pred.column_name) {
                                     if l_added.insert(pred.column_name.clone()) {
-                                        left_map.push((pred.column_name.clone(), pred.column_name.clone()));
+                                        left_map.push((
+                                            pred.column_name.clone(),
+                                            pred.column_name.clone(),
+                                        ));
                                     }
                                 } else if right_schema.contains_key(&pred.column_name) {
                                     if r_added.insert(pred.column_name.clone()) {
-                                        right_map.push((pred.column_name.clone(), pred.column_name.clone()));
+                                        right_map.push((
+                                            pred.column_name.clone(),
+                                            pred.column_name.clone(),
+                                        ));
                                     }
                                 }
-
-                                if let common::query::ComparisionValue::Column(ref rhs) = pred.value {
+                                if let common::query::ComparisionValue::Column(ref rhs) = pred.value
+                                {
                                     if left_schema.contains_key(rhs) {
                                         if l_added.insert(rhs.clone()) {
                                             left_map.push((rhs.clone(), rhs.clone()));
@@ -460,22 +508,26 @@ fn optimize_ast(op_node: QueryOp, ctx: &DbContext) -> QueryOp {
                                 }
                             }
 
-                            cross_data.left = Box::new(optimize_ast(QueryOp::Project(common::query::ProjectData {
-                                column_name_map: left_map,
-                                underlying: cross_data.left,
-                            }), ctx));
-                            cross_data.right = Box::new(optimize_ast(QueryOp::Project(common::query::ProjectData {
-                                column_name_map: right_map,
-                                underlying: cross_data.right,
-                            }), ctx));
-
+                            cross_data.left = Box::new(optimize_ast(
+                                QueryOp::Project(common::query::ProjectData {
+                                    column_name_map: left_map,
+                                    underlying: cross_data.left,
+                                }),
+                                ctx,
+                            ));
+                            cross_data.right = Box::new(optimize_ast(
+                                QueryOp::Project(common::query::ProjectData {
+                                    column_name_map: right_map,
+                                    underlying: cross_data.right,
+                                }),
+                                ctx,
+                            ));
                             filter_data.underlying = Box::new(QueryOp::Cross(cross_data));
                             return QueryOp::Project(common::query::ProjectData {
                                 column_name_map: proj_data.column_name_map,
                                 underlying: Box::new(QueryOp::Filter(filter_data)),
                             });
                         }
-
                         return QueryOp::Project(common::query::ProjectData {
                             column_name_map: proj_data.column_name_map,
                             underlying: Box::new(QueryOp::Filter(filter_data)),
@@ -484,28 +536,32 @@ fn optimize_ast(op_node: QueryOp, ctx: &DbContext) -> QueryOp {
 
                     let mut new_map = Vec::new();
                     let mut added = std::collections::HashSet::new();
-                    
                     for mapping in &proj_data.column_name_map {
                         let (_, src) = resolve_project_mapping(mapping, &proj_child_schema);
-                        if added.insert(src.clone()) { new_map.push((src.clone(), src.clone())); }
-                    }
-                    for pred in &filter_data.predicates {
-                        if added.insert(pred.column_name.clone()) { new_map.push((pred.column_name.clone(), pred.column_name.clone())); }
-                        if let common::query::ComparisionValue::Column(ref rhs) = pred.value {
-                            if added.insert(rhs.clone()) { new_map.push((rhs.clone(), rhs.clone())); }
+                        if added.insert(src.clone()) {
+                            new_map.push((src.clone(), src.clone()));
                         }
                     }
-                    
+                    for pred in &filter_data.predicates {
+                        if added.insert(pred.column_name.clone()) {
+                            new_map.push((pred.column_name.clone(), pred.column_name.clone()));
+                        }
+                        if let common::query::ComparisionValue::Column(ref rhs) = pred.value {
+                            if added.insert(rhs.clone()) {
+                                new_map.push((rhs.clone(), rhs.clone()));
+                            }
+                        }
+                    }
+
                     let pushed_project = QueryOp::Project(common::query::ProjectData {
-                        column_name_map: new_map, underlying: filter_data.underlying,
+                        column_name_map: new_map,
+                        underlying: filter_data.underlying,
                     });
-                    
                     let optimized_pushed_project = optimize_ast(pushed_project, ctx);
                     let new_filter = QueryOp::Filter(common::query::FilterData {
                         predicates: filter_data.predicates,
                         underlying: Box::new(optimized_pushed_project),
                     });
-                    
                     QueryOp::Project(common::query::ProjectData {
                         column_name_map: proj_data.column_name_map,
                         underlying: Box::new(new_filter),
@@ -520,53 +576,63 @@ fn optimize_ast(op_node: QueryOp, ctx: &DbContext) -> QueryOp {
                     for (k, v) in &right_schema {
                         child_schema.insert(k.clone(), v + offset);
                     }
-                    
+
                     let mut left_map = Vec::new();
                     let mut right_map = Vec::new();
                     let mut l_added = std::collections::HashSet::new();
                     let mut r_added = std::collections::HashSet::new();
-                    
+
                     for mapping in &proj_data.column_name_map {
                         let (_, src) = resolve_project_mapping(mapping, &child_schema);
                         if left_schema.contains_key(src) {
-                            if l_added.insert(src.clone()) { left_map.push((src.clone(), src.clone())); }
+                            if l_added.insert(src.clone()) {
+                                left_map.push((src.clone(), src.clone()));
+                            }
                         } else if right_schema.contains_key(src) {
-                            if r_added.insert(src.clone()) { right_map.push((src.clone(), src.clone())); }
+                            if r_added.insert(src.clone()) {
+                                right_map.push((src.clone(), src.clone()));
+                            }
                         }
                     }
-                    
-                    cross_data.left = Box::new(optimize_ast(QueryOp::Project(common::query::ProjectData {
-                        column_name_map: left_map, underlying: cross_data.left,
-                    }), ctx));
-                    
-                    cross_data.right = Box::new(optimize_ast(QueryOp::Project(common::query::ProjectData {
-                        column_name_map: right_map, underlying: cross_data.right,
-                    }), ctx));
-                    
+
+                    cross_data.left = Box::new(optimize_ast(
+                        QueryOp::Project(common::query::ProjectData {
+                            column_name_map: left_map,
+                            underlying: cross_data.left,
+                        }),
+                        ctx,
+                    ));
+                    cross_data.right = Box::new(optimize_ast(
+                        QueryOp::Project(common::query::ProjectData {
+                            column_name_map: right_map,
+                            underlying: cross_data.right,
+                        }),
+                        ctx,
+                    ));
                     QueryOp::Project(common::query::ProjectData {
                         column_name_map: proj_data.column_name_map,
                         underlying: Box::new(QueryOp::Cross(cross_data)),
                     })
                 }
 
-                other => {
-                    QueryOp::Project(common::query::ProjectData {
-                        column_name_map: proj_data.column_name_map,
-                        underlying: Box::new(other),
-                    })
-                }
+                other => QueryOp::Project(common::query::ProjectData {
+                    column_name_map: proj_data.column_name_map,
+                    underlying: Box::new(other),
+                }),
             }
         }
 
-        QueryOp::Sort(mut d) => { d.underlying = Box::new(optimize_ast(*d.underlying, ctx)); QueryOp::Sort(d) }
-        QueryOp::Cross(mut d) => { 
-            d.left = Box::new(optimize_ast(*d.left, ctx)); 
-            d.right = Box::new(optimize_ast(*d.right, ctx)); 
-            QueryOp::Cross(d) 
+        QueryOp::Sort(mut d) => {
+            d.underlying = Box::new(optimize_ast(*d.underlying, ctx));
+            QueryOp::Sort(d)
+        }
+        QueryOp::Cross(mut d) => {
+            d.left = Box::new(optimize_ast(*d.left, ctx));
+            d.right = Box::new(optimize_ast(*d.right, ctx));
+            QueryOp::Cross(d)
         }
     }
 }
-
 
 fn build_pipeline<'a, R: Read, W: Write>(
     op_node: QueryOp,
@@ -576,7 +642,11 @@ fn build_pipeline<'a, R: Read, W: Write>(
 ) -> Box<dyn Operator + 'a> {
     match op_node {
         QueryOp::Scan(data) => {
-            let spec = ctx.get_table_specs().iter().find(|t| t.name == data.table_id).expect("Table not found");
+            let spec = ctx
+                .get_table_specs()
+                .iter()
+                .find(|t| t.name == data.table_id)
+                .expect("Table not found");
             Box::new(ScanOperator::new(&data.table_id, spec, pool))
         }
         QueryOp::Filter(mut data) => {
@@ -588,11 +658,13 @@ fn build_pipeline<'a, R: Read, W: Write>(
                 for (i, pred) in data.predicates.iter().enumerate() {
                     if matches!(pred.operator, common::query::ComparisionOperator::EQ) {
                         if let common::query::ComparisionValue::Column(ref rhs_col) = pred.value {
-                            let is_bridge = (left_schema.contains_key(&pred.column_name) && right_schema.contains_key(rhs_col)) ||
-                                            (left_schema.contains_key(rhs_col) && right_schema.contains_key(&pred.column_name));
-
+                            let is_bridge = (left_schema.contains_key(&pred.column_name)
+                                && right_schema.contains_key(rhs_col))
+                                || (left_schema.contains_key(rhs_col)
+                                    && right_schema.contains_key(&pred.column_name));
                             if is_bridge {
-                                join_pred_idx = Some((i, pred.column_name.clone(), rhs_col.clone()));
+                                join_pred_idx =
+                                    Some((i, pred.column_name.clone(), rhs_col.clone()));
                                 break;
                             }
                         }
@@ -611,77 +683,129 @@ fn build_pipeline<'a, R: Read, W: Write>(
                     let build_on_left = left_est < right_est;
 
                     let pool_ptr = pool as *mut buffer_pool::BufferPoolManager<R, W>;
-                    let left_child = build_pipeline(*cross_data.left, ctx, pool, sort_memory_limit_bytes);
-                    let right_child = build_pipeline(*cross_data.right, ctx, unsafe { &mut *pool_ptr }, sort_memory_limit_bytes);
+                    let left_child =
+                        build_pipeline(*cross_data.left, ctx, pool, sort_memory_limit_bytes);
+                    let right_child = build_pipeline(
+                        *cross_data.right,
+                        ctx,
+                        unsafe { &mut *pool_ptr },
+                        sort_memory_limit_bytes,
+                    );
 
                     let num_partitions = 64;
                     let scratch_block_size = unsafe { &*pool_ptr }.disk_manager.block_size;
-                    
-                    let hash_join: Box<dyn Operator + 'a> = Box::new(crate::operators::GraceHashJoinOperator::new(
-                        left_child, right_child, left_col_idx, right_col_idx,
-                        build_on_left, num_partitions, pool_ptr, scratch_block_size,
-                    ));
+
+                    let hash_join: Box<dyn Operator + 'a> =
+                        Box::new(crate::operators::GraceHashJoinOperator::new(
+                            left_child,
+                            right_child,
+                            left_col_idx,
+                            right_col_idx,
+                            build_on_left,
+                            num_partitions,
+                            pool_ptr,
+                            scratch_block_size,
+                        ));
 
                     data.predicates.remove(idx);
-
                     if data.predicates.is_empty() {
-                        return hash_join; 
+                        return hash_join;
                     } else {
                         let mut combined_schema = left_schema;
                         let offset = combined_schema.len();
                         for (k, v) in right_schema {
                             combined_schema.insert(k, v + offset);
                         }
-                        return Box::new(FilterOperator::new(hash_join, data.predicates, combined_schema));
+                        return Box::new(FilterOperator::new(
+                            hash_join,
+                            data.predicates,
+                            combined_schema,
+                        ));
                     }
                 }
                 data.underlying = Box::new(QueryOp::Cross(cross_data));
             }
-
             let schema = get_output_schema(&data.underlying, ctx);
-            Box::new(FilterOperator::new(build_pipeline(*data.underlying, ctx, pool, sort_memory_limit_bytes), data.predicates, schema))
+            Box::new(FilterOperator::new(
+                build_pipeline(*data.underlying, ctx, pool, sort_memory_limit_bytes),
+                data.predicates,
+                schema,
+            ))
         }
 
         QueryOp::Project(data) => {
             let schema = get_output_schema(&data.underlying, ctx);
-            let indices = data
+            let sources = data
                 .column_name_map
                 .iter()
                 .map(|mapping| {
                     let (_, src) = resolve_project_mapping(mapping, &schema);
-                    schema[src]
+                    if let Some(&idx) = schema.get(src) {
+                        crate::operators::ProjectSource::Index(idx)
+                    } else {
+                        let literal = if (src.starts_with('\'') && src.ends_with('\''))
+                            || (src.starts_with('"') && src.ends_with('"'))
+                        {
+                            if src.len() >= 2 {
+                                src[1..src.len() - 1].to_string()
+                            } else {
+                                src.clone()
+                            }
+                        } else {
+                            src.clone()
+                        };
+                        crate::operators::ProjectSource::Literal(literal)
+                    }
                 })
                 .collect();
-            Box::new(ProjectOperator::new(build_pipeline(*data.underlying, ctx, pool, sort_memory_limit_bytes), indices))
+            Box::new(ProjectOperator::new(
+                build_pipeline(*data.underlying, ctx, pool, sort_memory_limit_bytes),
+                sources,
+            ))
         }
 
         QueryOp::Sort(data) => {
             let schema = get_output_schema(&data.underlying, ctx);
-            let indices = data.sort_specs.iter().map(|s| (schema[&s.column_name], s.ascending)).collect();
+            let indices = data
+                .sort_specs
+                .iter()
+                .map(|s| (schema[&s.column_name], s.ascending))
+                .collect();
             let scratch_block_size = pool.disk_manager.block_size;
             let pool_ptr = pool as *mut buffer_pool::BufferPoolManager<R, W>;
             Box::new(SortOperator::new(
                 build_pipeline(*data.underlying, ctx, pool, sort_memory_limit_bytes),
-                indices, sort_memory_limit_bytes, pool_ptr, scratch_block_size,
+                indices,
+                sort_memory_limit_bytes,
+                pool_ptr,
+                scratch_block_size,
             ))
         }
         QueryOp::Cross(data) => {
             let left_est = estimate_cardinality(&data.left, ctx);
             let right_est = estimate_cardinality(&data.right, ctx);
             let materialize_left = left_est <= right_est;
-            
             let pool_ptr = pool as *mut buffer_pool::BufferPoolManager<R, W>;
             let scratch_block_size = unsafe { &*pool_ptr }.disk_manager.block_size;
-            
             let left = build_pipeline(*data.left, ctx, pool, sort_memory_limit_bytes);
-            let right = build_pipeline(*data.right, ctx, unsafe { &mut *pool_ptr }, sort_memory_limit_bytes);
-            Box::new(CrossOperator::new(left, right, materialize_left, pool_ptr, scratch_block_size))
+            let right = build_pipeline(
+                *data.right,
+                ctx,
+                unsafe { &mut *pool_ptr },
+                sort_memory_limit_bytes,
+            );
+            Box::new(CrossOperator::new(
+                left,
+                right,
+                materialize_left,
+                pool_ptr,
+                scratch_block_size,
+            ))
         }
     }
 }
 
 fn db_main() -> Result<()> {
-
     let cli_options = CliOptions::parse();
     let ctx = DbContext::load_from_file(cli_options.get_config_path())?;
 
@@ -702,28 +826,28 @@ fn db_main() -> Result<()> {
     monitor_out.flush()?;
     monitor_buf_reader.read_line(&mut input_line)?;
 
-    let memory_limit_mb: u32 = input_line.trim().parse().context("Memory parse error")?;
-    let disk_manager = buffer_pool::DiskManager::new(disk_buf_reader, disk_out); 
-    let total_mem = memory_limit_mb as u64 * 1024 * 1024; 
-    let pool_mem = (total_mem / 16).max(4 * 1024 * 1024);
-    let num_frames = (pool_mem / 4096) as usize;
-    let sort_memory_limit_bytes = ((total_mem / 8).max(8 * 1024 * 1024)) as usize;
-    
-    let mut pool = buffer_pool::BufferPoolManager::new(disk_manager, num_frames); 
+    let disk_manager = buffer_pool::DiskManager::new(disk_buf_reader, disk_out);
 
+    // HARD CAP MEMORY: Guarantee we safely navigate below the 64 MB OOM ceiling
+    let pool_mem = 4 * 1024 * 1024; // 4 MB Buffer Pool
+    let num_frames = pool_mem / 4096;
+
+    // Limits dynamically sized vectors from passing ~20MB combined across operators
+    let sort_memory_limit_bytes = 10 * 1024 * 1024;
+
+    let mut pool = buffer_pool::BufferPoolManager::new(disk_manager, num_frames);
     let mut root_operator = build_pipeline(query.root, &ctx, &mut pool, sort_memory_limit_bytes);
 
     monitor_out.write_all(b"validate\n")?;
-    monitor_out.flush()?; 
+    monitor_out.flush()?;
 
     while let Some(row) = root_operator.next() {
         let row_string = row.to_output_string();
-        
         if monitor_out.write_all(row_string.as_bytes()).is_err() {
             return Ok(());
         }
     }
-    
+
     let _ = monitor_out.write_all(b"!\n");
     let _ = monitor_out.flush();
     Ok(())

@@ -34,7 +34,7 @@ fn main() -> Result<()> {
 
     let mut query_configs = Vec::new();
     let mut query_number = 0;
-    for (query, sql_query,is_output_sorted) in tests {
+    for (query, sql_query, is_output_sorted) in tests {
         query_number += 1;
         println!("Processing query {}", sql_query);
 
@@ -55,7 +55,7 @@ fn main() -> Result<()> {
             .write_all(sql_query.as_bytes())
             .context("Failed to write to sqlite_process")?;
         drop(pipe_writer); // Otherwise process will hang forever
-        
+
         let exist_status = sqlite_process
             .wait()
             .context("Failed to wait on sqlite3 process")?;
@@ -81,13 +81,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn get_all_tests() -> Vec<(Query, String,bool)> {
+fn get_all_tests() -> Vec<(Query, String, bool)> {
     let mut all_tests = get_all_correctness_tests();
     all_tests.extend(get_all_benchmark_tests());
     all_tests
 }
 
-fn get_all_correctness_tests() -> Vec<(Query, String,bool)> {
+fn get_all_correctness_tests() -> Vec<(Query, String, bool)> {
     vec![
         tests::test_q1(),
         tests::test_q2(),
@@ -142,7 +142,7 @@ fn get_all_correctness_tests() -> Vec<(Query, String,bool)> {
     ]
 }
 
-fn get_all_benchmark_tests() -> Vec<(Query, String,bool)> {
+fn get_all_benchmark_tests() -> Vec<(Query, String, bool)> {
     vec![
         tests::query_1(),
         tests::query_2(),

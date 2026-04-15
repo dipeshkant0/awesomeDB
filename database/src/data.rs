@@ -1,8 +1,8 @@
+use common::DataType;
+use db_config::table::ColumnSpec;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use common::DataType;
-use db_config::table::ColumnSpec;
 
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub enum Value {
@@ -18,11 +18,26 @@ impl Eq for Value {}
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
-            Value::Int32(v) => { 1u8.hash(state); v.hash(state); }
-            Value::Int64(v) => { 2u8.hash(state); v.hash(state); }
-            Value::Float32(v) => { 3u8.hash(state); v.to_bits().hash(state); }
-            Value::Float64(v) => { 4u8.hash(state); v.to_bits().hash(state); }
-            Value::String(v) => { 5u8.hash(state); v.hash(state); }
+            Value::Int32(v) => {
+                1u8.hash(state);
+                v.hash(state);
+            }
+            Value::Int64(v) => {
+                2u8.hash(state);
+                v.hash(state);
+            }
+            Value::Float32(v) => {
+                3u8.hash(state);
+                v.to_bits().hash(state);
+            }
+            Value::Float64(v) => {
+                4u8.hash(state);
+                v.to_bits().hash(state);
+            }
+            Value::String(v) => {
+                5u8.hash(state);
+                v.hash(state);
+            }
         }
     }
 }
@@ -30,7 +45,7 @@ impl Hash for Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Value::Float64(v) => write!(f, "{:?}", v), 
+            Value::Float64(v) => write!(f, "{:?}", v),
             Value::Float32(v) => write!(f, "{:?}", v),
             Value::Int32(v) => write!(f, "{}", v),
             Value::Int64(v) => write!(f, "{}", v),
@@ -102,10 +117,22 @@ impl Value {
 
     fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
-            Self::Int32(v) => { out.push(1); out.extend_from_slice(&v.to_le_bytes()); }
-            Self::Int64(v) => { out.push(2); out.extend_from_slice(&v.to_le_bytes()); }
-            Self::Float32(v) => { out.push(3); out.extend_from_slice(&v.to_le_bytes()); }
-            Self::Float64(v) => { out.push(4); out.extend_from_slice(&v.to_le_bytes()); }
+            Self::Int32(v) => {
+                out.push(1);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Self::Int64(v) => {
+                out.push(2);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Self::Float32(v) => {
+                out.push(3);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Self::Float64(v) => {
+                out.push(4);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
             Self::String(v) => {
                 out.push(5);
                 let len = u32::try_from(v.len()).expect("Row string too large to encode");
@@ -147,7 +174,7 @@ impl Value {
                 let bytes = input.get(*offset..*offset + len)?;
                 *offset += len;
                 let value = String::from_utf8(bytes.to_vec()).ok()?;
-                Some(Self::String(value.into())) 
+                Some(Self::String(value.into()))
             }
             _ => None,
         }
@@ -155,7 +182,9 @@ impl Value {
 }
 
 pub fn deserialize_block(data: &[u8], columns: &[ColumnSpec]) -> Vec<Row> {
-    if data.len() < 2 { return Vec::new(); }
+    if data.len() < 2 {
+        return Vec::new();
+    }
     let map_capacity = data.len() - 2;
     let row_count = u16::from_le_bytes([data[map_capacity], data[map_capacity + 1]]) as usize;
     let mut rows = Vec::with_capacity(row_count);
@@ -168,38 +197,58 @@ pub fn deserialize_block(data: &[u8], columns: &[ColumnSpec]) -> Vec<Row> {
         for col in columns {
             match col.data_type {
                 DataType::Int64 => {
-                    if offset + 8 > map_capacity { row_valid = false; break; }
-                    let val = i64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
+                    if offset + 8 > map_capacity {
+                        row_valid = false;
+                        break;
+                    }
+                    let val = i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
                     values.push(Value::Int64(val));
                     offset += 8;
                 }
                 DataType::Float64 => {
-                    if offset + 8 > map_capacity { row_valid = false; break; }
-                    let val = f64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
+                    if offset + 8 > map_capacity {
+                        row_valid = false;
+                        break;
+                    }
+                    let val = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
                     values.push(Value::Float64(val));
                     offset += 8;
                 }
                 DataType::Int32 => {
-                    if offset + 4 > map_capacity { row_valid = false; break; }
-                    let val = i32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+                    if offset + 4 > map_capacity {
+                        row_valid = false;
+                        break;
+                    }
+                    let val = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
                     values.push(Value::Int32(val));
                     offset += 4;
                 }
                 DataType::Float32 => {
-                    if offset + 4 > map_capacity { row_valid = false; break; }
-                    let val = f32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+                    if offset + 4 > map_capacity {
+                        row_valid = false;
+                        break;
+                    }
+                    let val = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
                     values.push(Value::Float32(val));
                     offset += 4;
                 }
                 DataType::String => {
                     let mut end = offset;
-                    while end < map_capacity && data[end] != 0 { end += 1; }
-                    if end >= map_capacity { row_valid = false; break; }
+                    while end < map_capacity && data[end] != 0 {
+                        end += 1;
+                    }
+                    if end >= map_capacity {
+                        row_valid = false;
+                        break;
+                    }
                     let s = match std::str::from_utf8(&data[offset..end]) {
                         Ok(s) => s.to_owned(),
-                        Err(_) => { row_valid = false; break; }
+                        Err(_) => {
+                            row_valid = false;
+                            break;
+                        }
                     };
-                    values.push(Value::String(s.into())); 
+                    values.push(Value::String(s.into()));
                     offset = end + 1;
                 }
             }

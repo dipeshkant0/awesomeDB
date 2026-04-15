@@ -354,7 +354,8 @@ pub fn test_q20() -> (Query, String, bool) {
 SELECT n_name, '' FROM nation WHERE n_regionkey = 3 ORDER BY n_name DESC, n_nationkey;
 */
 pub fn test_q21() -> (Query, String, bool) {
-    let sql = "SELECT n_name, '' FROM nation WHERE n_regionkey = 3 ORDER BY n_name DESC, n_nationkey;";
+    let sql =
+        "SELECT n_name, '' FROM nation WHERE n_regionkey = 3 ORDER BY n_name DESC, n_nationkey;";
     let query = QueryOp::scan("nation")
         .filter(
             "n_regionkey",
@@ -726,7 +727,8 @@ pub fn test_q39() -> (Query, String, bool) {
 SELECT s_name, ps_availqty, '' FROM supplier, partsupp WHERE s_suppkey = ps_suppkey;
 */
 pub fn test_q40() -> (Query, String, bool) {
-    let sql = "SELECT s_name, ps_availqty, '' FROM supplier, partsupp WHERE s_suppkey = ps_suppkey;";
+    let sql =
+        "SELECT s_name, ps_availqty, '' FROM supplier, partsupp WHERE s_suppkey = ps_suppkey;";
     let query = QueryOp::scan("supplier")
         .cross(QueryOp::scan("partsupp"))
         .filter(

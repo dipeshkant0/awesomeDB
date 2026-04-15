@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports, unused_mut, unreachable_code)]
 use crate::buffer_pool::BufferPoolManager;
 use crate::data::{Row, Value};
 use common::query::{ComparisionOperator, ComparisionValue, Predicate};

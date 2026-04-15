@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports, unused_mut, unreachable_code)]
 use anyhow::{Context, Result};
 use clap::Parser;
 use common::query::{Query, QueryOp};

@@ -93,11 +93,9 @@ impl Row {
         let count = u32::from_le_bytes(count_bytes) as usize;
         let mut values = Vec::with_capacity(count);
         let mut offset = 4;
-
         for _ in 0..count {
             values.push(Value::decode_from(input, &mut offset)?);
         }
-
         if offset == input.len() {
             Some(Self { values })
         } else {
@@ -114,7 +112,6 @@ impl Value {
             Self::String(v) => 1 + 4 + v.len(),
         }
     }
-
     fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
             Self::Int32(v) => {
@@ -135,7 +132,7 @@ impl Value {
             }
             Self::String(v) => {
                 out.push(5);
-                let len = u32::try_from(v.len()).expect("Row string too large to encode");
+                let len = u32::try_from(v.len()).expect("Row string too large");
                 out.extend_from_slice(&len.to_le_bytes());
                 out.extend_from_slice(v.as_bytes());
             }
@@ -145,7 +142,6 @@ impl Value {
     fn decode_from(input: &[u8], offset: &mut usize) -> Option<Self> {
         let tag = *input.get(*offset)?;
         *offset += 1;
-
         match tag {
             1 => {
                 let bytes: [u8; 4] = input.get(*offset..*offset + 4)?.try_into().ok()?;
@@ -193,7 +189,6 @@ pub fn deserialize_block(data: &[u8], columns: &[ColumnSpec]) -> Vec<Row> {
     for _ in 0..row_count {
         let mut values = Vec::with_capacity(columns.len());
         let mut row_valid = true;
-
         for col in columns {
             match col.data_type {
                 DataType::Int64 => {
@@ -201,8 +196,9 @@ pub fn deserialize_block(data: &[u8], columns: &[ColumnSpec]) -> Vec<Row> {
                         row_valid = false;
                         break;
                     }
-                    let val = i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-                    values.push(Value::Int64(val));
+                    values.push(Value::Int64(i64::from_le_bytes(
+                        data[offset..offset + 8].try_into().unwrap(),
+                    )));
                     offset += 8;
                 }
                 DataType::Float64 => {
@@ -210,8 +206,9 @@ pub fn deserialize_block(data: &[u8], columns: &[ColumnSpec]) -> Vec<Row> {
                         row_valid = false;
                         break;
                     }
-                    let val = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-                    values.push(Value::Float64(val));
+                    values.push(Value::Float64(f64::from_le_bytes(
+                        data[offset..offset + 8].try_into().unwrap(),
+                    )));
                     offset += 8;
                 }
                 DataType::Int32 => {
@@ -219,8 +216,9 @@ pub fn deserialize_block(data: &[u8], columns: &[ColumnSpec]) -> Vec<Row> {
                         row_valid = false;
                         break;
                     }
-                    let val = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-                    values.push(Value::Int32(val));
+                    values.push(Value::Int32(i32::from_le_bytes(
+                        data[offset..offset + 4].try_into().unwrap(),
+                    )));
                     offset += 4;
                 }
                 DataType::Float32 => {
@@ -228,8 +226,9 @@ pub fn deserialize_block(data: &[u8], columns: &[ColumnSpec]) -> Vec<Row> {
                         row_valid = false;
                         break;
                     }
-                    let val = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-                    values.push(Value::Float32(val));
+                    values.push(Value::Float32(f32::from_le_bytes(
+                        data[offset..offset + 4].try_into().unwrap(),
+                    )));
                     offset += 4;
                 }
                 DataType::String => {
@@ -253,7 +252,6 @@ pub fn deserialize_block(data: &[u8], columns: &[ColumnSpec]) -> Vec<Row> {
                 }
             }
         }
-
         if row_valid && values.len() == columns.len() {
             rows.push(Row { values });
         } else {

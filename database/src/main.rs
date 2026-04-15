@@ -1,4 +1,10 @@
-#![allow(dead_code, unused_variables, unused_imports, unused_mut, unreachable_code)]
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_imports,
+    unused_mut,
+    unreachable_code
+)]
 use anyhow::{Context, Result};
 use clap::Parser;
 use common::query::{Query, QueryOp};
@@ -795,6 +801,7 @@ fn build_pipeline<'a, R: Read, W: Write>(
                 unsafe { &mut *pool_ptr },
                 sort_memory_limit_bytes,
             );
+
             Box::new(CrossOperator::new(
                 left,
                 right,
@@ -809,46 +816,33 @@ fn build_pipeline<'a, R: Read, W: Write>(
 fn db_main() -> Result<()> {
     let cli_options = CliOptions::parse();
     let ctx = DbContext::load_from_file(cli_options.get_config_path())?;
-
     let (disk_in, disk_out) = setup_disk_io();
     let (monitor_in, mut monitor_out) = setup_monitor_io();
-
     let disk_buf_reader = BufReader::new(disk_in);
     let mut monitor_buf_reader = BufReader::new(monitor_in);
 
     let mut input_line = String::new();
     monitor_buf_reader.read_line(&mut input_line)?;
     let mut query: Query = serde_json::from_str(&input_line).context("JSON Parse Error")?;
-
     query.root = optimize_ast(query.root, &ctx);
 
-    input_line.clear();
-    monitor_out.write_all(b"get_memory_limit\n")?;
-    monitor_out.flush()?;
-    monitor_buf_reader.read_line(&mut input_line)?;
-
-    let disk_manager = buffer_pool::DiskManager::new(disk_buf_reader, disk_out);
-
-    // HARD CAP MEMORY: Guarantee we safely navigate below the 64 MB OOM ceiling
-    let pool_mem = 4 * 1024 * 1024; // 4 MB Buffer Pool
+    let total_mem = 64 * 1024 * 1024; 
+    let pool_mem = 16 * 1024 * 1024;                
+    let sort_memory_limit_bytes = 16 * 1024 * 1024; 
     let num_frames = pool_mem / 4096;
 
-    // Limits dynamically sized vectors from passing ~20MB combined across operators
-    let sort_memory_limit_bytes = 10 * 1024 * 1024;
-
+    let disk_manager = buffer_pool::DiskManager::new(disk_buf_reader, disk_out);
     let mut pool = buffer_pool::BufferPoolManager::new(disk_manager, num_frames);
     let mut root_operator = build_pipeline(query.root, &ctx, &mut pool, sort_memory_limit_bytes);
 
     monitor_out.write_all(b"validate\n")?;
     monitor_out.flush()?;
-
     while let Some(row) = root_operator.next() {
         let row_string = row.to_output_string();
         if monitor_out.write_all(row_string.as_bytes()).is_err() {
             return Ok(());
         }
     }
-
     let _ = monitor_out.write_all(b"!\n");
     let _ = monitor_out.flush();
     Ok(())

@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 
 pub struct DiskManager<R: Read, W: Write> {
@@ -53,10 +53,21 @@ impl<R: Read, W: Write> DiskManager<R, W> {
 
     pub fn read_pages_direct(&mut self, start_block: u64, num_blocks: usize) -> Vec<u8> {
         let mut buffer = vec![0; num_blocks * self.block_size];
+        self.read_pages_direct_into(start_block, num_blocks, &mut buffer);
+        buffer
+    }
+
+    pub fn read_pages_direct_into(
+        &mut self,
+        start_block: u64,
+        num_blocks: usize,
+        buffer: &mut Vec<u8>,
+    ) {
+        let target_len = num_blocks * self.block_size;
+        buffer.resize(target_len, 0);
         write!(self.disk_out, "get block {} {}\n", start_block, num_blocks).unwrap();
         self.disk_out.flush().unwrap();
-        self.disk_in.read_exact(&mut buffer).unwrap();
-        buffer
+        self.disk_in.read_exact(buffer).unwrap();
     }
 
     pub fn write_pages_direct(&mut self, start_block: u64, num_blocks: usize, buffer: &[u8]) {
@@ -93,6 +104,26 @@ impl<R: Read, W: Write> DiskManager<R, W> {
                 start
             })
         } else {
+            if !self.free_blocks.is_empty() {
+                self.free_blocks.sort_unstable();
+                let mut sequence_start_idx = 0;
+                let mut current_len = 1;
+
+                for i in 1..self.free_blocks.len() {
+                    if self.free_blocks[i] == self.free_blocks[i - 1] + 1 {
+                        current_len += 1;
+                        if current_len == num_blocks {
+                            let start_block = self.free_blocks[sequence_start_idx];
+                            self.free_blocks.drain(sequence_start_idx..=i);
+                            return start_block;
+                        }
+                    } else {
+                        sequence_start_idx = i;
+                        current_len = 1;
+                    }
+                }
+            }
+
             let start = self.next_free_anon_block;
             self.next_free_anon_block += num_blocks;
             start
@@ -104,12 +135,18 @@ impl<R: Read, W: Write> DiskManager<R, W> {
     }
 }
 
+#[derive(PartialEq, Clone, Copy)]
+pub enum QueueType {
+    Am,   // Main Cache (Hot)
+    A1in, // Probation Cache (Cold)
+}
+
 pub struct Frame {
     pub data: Vec<u8>,
     pub is_dirty: bool,
     pub pin_count: u32,
     pub block_id: Option<u64>,
-    pub referenced: bool,
+    pub queue_type: Option<QueueType>,
 }
 
 pub struct BufferPoolManager<R: Read, W: Write> {
@@ -117,7 +154,13 @@ pub struct BufferPoolManager<R: Read, W: Write> {
     pub frames: Vec<Frame>,
     page_table: HashMap<u64, usize>,
     free_list: VecDeque<usize>,
-    clock_hand: usize,
+
+    am: VecDeque<usize>,
+    a1in: VecDeque<usize>,
+    a1out: VecDeque<u64>,
+    a1out_set: HashSet<u64>,
+    kin: usize,
+    kout: usize,
 }
 
 impl<R: Read, W: Write> BufferPoolManager<R, W> {
@@ -132,7 +175,7 @@ impl<R: Read, W: Write> BufferPoolManager<R, W> {
                 is_dirty: false,
                 pin_count: 0,
                 block_id: None,
-                referenced: false,
+                queue_type: None,
             });
             free_list.push_back(i);
         }
@@ -140,43 +183,147 @@ impl<R: Read, W: Write> BufferPoolManager<R, W> {
         Self {
             disk_manager,
             frames,
-            page_table: HashMap::new(),
+            page_table: HashMap::with_capacity(num_frames),
             free_list,
-            clock_hand: 0,
+            am: VecDeque::with_capacity(num_frames),
+            a1in: VecDeque::with_capacity(num_frames),
+            a1out: VecDeque::with_capacity(num_frames),
+            a1out_set: HashSet::with_capacity(num_frames),
+            kin: std::cmp::max(1, num_frames / 4),
+            kout: std::cmp::max(1, num_frames / 2),
         }
     }
 
     pub fn fetch_page(&mut self, block_id: u64) -> Result<usize, String> {
-        // Cache Hit
         if let Some(&frame_id) = self.page_table.get(&block_id) {
-            self.frames[frame_id].pin_count += 1;
-            self.frames[frame_id].referenced = true; // Mark used for CLOCK
+            let frame = &mut self.frames[frame_id];
+            frame.pin_count += 1;
+
+            if frame.queue_type == Some(QueueType::Am) {
+                if let Some(idx) = self.am.iter().position(|&x| x == frame_id) {
+                    self.am.remove(idx);
+                    self.am.push_front(frame_id);
+                }
+            }
+
             return Ok(frame_id);
         }
 
-        // Cache Miss
-        let frame_id = self.find_victim_frame()?;
+        if self.a1out_set.contains(&block_id) {
+            let frame_id = self.find_victim_frame()?;
 
-        // Evict old page if necessary
-        if let Some(old_block_id) = self.frames[frame_id].block_id {
-            if self.frames[frame_id].is_dirty {
-                self.disk_manager
-                    .write_page(old_block_id, &self.frames[frame_id].data);
+            self.a1out_set.remove(&block_id);
+            if let Some(idx) = self.a1out.iter().position(|&x| x == block_id) {
+                self.a1out.remove(idx);
             }
-            self.page_table.remove(&old_block_id);
+
+            self.disk_manager
+                .read_page(block_id, &mut self.frames[frame_id].data);
+
+            let frame = &mut self.frames[frame_id];
+            frame.block_id = Some(block_id);
+            frame.pin_count = 1;
+            frame.is_dirty = false;
+            frame.queue_type = Some(QueueType::Am);
+
+            self.am.push_front(frame_id);
+            self.page_table.insert(block_id, frame_id);
+
+            return Ok(frame_id);
         }
 
-        // Load new page
+        let frame_id = self.find_victim_frame()?;
+
         self.disk_manager
             .read_page(block_id, &mut self.frames[frame_id].data);
 
-        self.frames[frame_id].block_id = Some(block_id);
-        self.frames[frame_id].pin_count = 1;
-        self.frames[frame_id].is_dirty = false;
-        self.frames[frame_id].referenced = true;
+        let frame = &mut self.frames[frame_id];
+        frame.block_id = Some(block_id);
+        frame.pin_count = 1;
+        frame.is_dirty = false;
+        frame.queue_type = Some(QueueType::A1in);
 
+        self.a1in.push_front(frame_id);
         self.page_table.insert(block_id, frame_id);
+
         Ok(frame_id)
+    }
+
+    fn find_victim_frame(&mut self) -> Result<usize, String> {
+        if let Some(frame_id) = self.free_list.pop_front() {
+            return Ok(frame_id);
+        }
+
+        if !self.a1in.is_empty() {
+            for i in 0..self.a1in.len() {
+                let idx = self.a1in.len() - 1 - i;
+                if self.frames[self.a1in[idx]].pin_count == 0 {
+                    return Ok(self.evict_from_a1in(idx));
+                }
+            }
+        }
+
+        if !self.am.is_empty() {
+            for i in 0..self.am.len() {
+                let idx = self.am.len() - 1 - i;
+                if self.frames[self.am[idx]].pin_count == 0 {
+                    return Ok(self.evict_from_am(idx));
+                }
+            }
+        }
+
+        // All frames are pinned — cannot evict. Under RLIMIT_AS a panic backtrace
+        // can itself OOM, so exit cleanly.
+        eprintln!("FATAL: Buffer pool exhausted — all frames pinned");
+        std::process::exit(1);
+    }
+
+    fn evict_from_a1in(&mut self, list_index: usize) -> usize {
+        let frame_id = self.a1in.remove(list_index).unwrap();
+        let old_block_id = self.frames[frame_id].block_id.unwrap();
+
+        self.write_back_if_dirty(frame_id);
+        self.page_table.remove(&old_block_id);
+
+        self.a1out.push_front(old_block_id);
+        self.a1out_set.insert(old_block_id);
+
+        if self.a1out.len() > self.kout {
+            if let Some(forgotten_block) = self.a1out.pop_back() {
+                self.a1out_set.remove(&forgotten_block);
+            }
+        }
+
+        self.clear_frame(frame_id);
+        frame_id
+    }
+
+    fn evict_from_am(&mut self, list_index: usize) -> usize {
+        let frame_id = self.am.remove(list_index).unwrap();
+        let old_block_id = self.frames[frame_id].block_id.unwrap();
+
+        self.write_back_if_dirty(frame_id);
+        self.page_table.remove(&old_block_id);
+
+        self.clear_frame(frame_id);
+        frame_id
+    }
+
+    fn write_back_if_dirty(&mut self, frame_id: usize) {
+        let frame = &mut self.frames[frame_id];
+        if frame.is_dirty {
+            if let Some(block_id) = frame.block_id {
+                self.disk_manager.write_page(block_id, &frame.data);
+            }
+        }
+    }
+
+    fn clear_frame(&mut self, frame_id: usize) {
+        let frame = &mut self.frames[frame_id];
+        frame.block_id = None;
+        frame.is_dirty = false;
+        frame.pin_count = 0;
+        frame.queue_type = None;
     }
 
     pub fn get_frame_data(&self, frame_id: usize) -> &[u8] {
@@ -199,44 +346,18 @@ impl<R: Read, W: Write> BufferPoolManager<R, W> {
         self.disk_manager.read_pages_direct(start_block, num_blocks)
     }
 
+    pub fn read_pages_direct_into(
+        &mut self,
+        start_block: u64,
+        num_blocks: usize,
+        buffer: &mut Vec<u8>,
+    ) {
+        self.disk_manager
+            .read_pages_direct_into(start_block, num_blocks, buffer)
+    }
+
     pub fn write_pages_direct(&mut self, start_block: u64, num_blocks: usize, buffer: &[u8]) {
         self.disk_manager
             .write_pages_direct(start_block, num_blocks, buffer)
-    }
-
-    fn find_victim_frame(&mut self) -> Result<usize, String> {
-        if let Some(frame_id) = self.free_list.pop_front() {
-            return Ok(frame_id);
-        }
-
-        let start = self.clock_hand;
-        let mut looped_once = false;
-
-        loop {
-            let frame = &mut self.frames[self.clock_hand];
-
-            if frame.pin_count == 0 {
-                if frame.referenced {
-                    frame.referenced = false; // Give a second chance
-                } else {
-                    // Evict
-                    let victim = self.clock_hand;
-                    self.clock_hand = (self.clock_hand + 1) % self.frames.len();
-                    return Ok(victim);
-                }
-            }
-
-            self.clock_hand = (self.clock_hand + 1) % self.frames.len();
-
-            if self.clock_hand == start {
-                if looped_once {
-                    let all_pinned = self.frames.iter().all(|f| f.pin_count > 0);
-                    if all_pinned {
-                        return Err("OOM: All frames pinned!".to_string());
-                    }
-                }
-                looped_once = true;
-            }
-        }
     }
 }

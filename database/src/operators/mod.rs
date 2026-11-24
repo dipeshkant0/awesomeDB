@@ -17,7 +17,6 @@ pub trait Operator {
     fn next(&mut self) -> Option<Row>;
 }
 
-// Re-export operators for easier access
-pub use join::{CrossOperator, GraceHashJoinOperator};
+pub use join::CrossOperator;
 pub use relational::{FilterOperator, ProjectOperator, ProjectSource, ScanOperator};
 pub use sort::SortOperator;

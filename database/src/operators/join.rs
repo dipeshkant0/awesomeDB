@@ -13,8 +13,837 @@ use super::io_utils::{
 };
 use crate::buffer_pool::BufferPoolManager;
 use crate::data::{Row, Value};
+use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
+
+const MIN_OPERATOR_MEMORY_BYTES: usize = 1 * 1024 * 1024;
+const MIN_CROSS_STREAM_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+const CROSS_SPILL_WRITER_TARGET_BYTES: usize = 1 * 1024 * 1024;
+const BLOOM_FILTER_BYTES: usize = 128 * 1024;
+const GRACE_HASH_MIN_PARTITIONS: usize = 8;
+const GRACE_HASH_MAX_PARTITIONS: usize = 64;
+
+#[inline(always)]
+fn scratch_writer_blocks(block_size: usize) -> usize {
+    ((CROSS_SPILL_WRITER_TARGET_BYTES + block_size - 1) / block_size).max(1)
+}
+
+pub struct BufferedOperator<'a> {
+    stolen_rows: std::vec::IntoIter<Row>,
+    child: Box<dyn Operator + 'a>,
+}
+
+impl<'a> BufferedOperator<'a> {
+    pub fn new(stolen_rows: Vec<Row>, child: Box<dyn Operator + 'a>) -> Self {
+        Self {
+            stolen_rows: stolen_rows.into_iter(),
+            child,
+        }
+    }
+}
+
+impl<'a> Operator for BufferedOperator<'a> {
+    #[inline(always)]
+    fn next(&mut self) -> Option<Row> {
+        if let Some(row) = self.stolen_rows.next() {
+            return Some(row);
+        }
+        self.child.next()
+    }
+}
+
+pub struct InMemoryHashJoinOperator<'a> {
+    left_child: Box<dyn Operator + 'a>,
+    build_rows: Vec<Row>,
+    left_col_idx: usize,
+    right_col_idx: usize,
+    hash_table: FastMap<Value, Vec<usize>>,
+    bloom_filter: BloomFilter,
+    left_row: Option<Row>,
+    match_indices: Vec<usize>,
+    match_idx: usize,
+    initialized: bool,
+}
+
+impl<'a> InMemoryHashJoinOperator<'a> {
+    pub fn new(left: Box<dyn Operator + 'a>, build_rows: Vec<Row>, left_col_idx: usize, right_col_idx: usize) -> Self {
+        // Scale bloom filter proportional to build size:
+        // - Tiny builds (< 1K rows): 8KB bloom is sufficient
+        // - Small builds (< 10K rows): 32KB
+        // - Normal builds: 64KB
+        // Avoids wasting 128KB on tiny builds under 64MB RLIMIT_AS.
+        let bloom_bytes = if build_rows.len() < 1_000 {
+            8 * 1024
+        } else if build_rows.len() < 10_000 {
+            32 * 1024
+        } else {
+            64 * 1024
+        };
+        Self {
+            left_child: left,
+            build_rows,
+            left_col_idx,
+            right_col_idx,
+            hash_table: FastMap::default(),
+            bloom_filter: BloomFilter::new(bloom_bytes),
+            left_row: None,
+            match_indices: Vec::new(),
+            match_idx: 0,
+            initialized: false,
+        }
+    }
+}
+
+impl<'a> Operator for InMemoryHashJoinOperator<'a> {
+    fn next(&mut self) -> Option<Row> {
+        if !self.initialized {
+            for (idx, row) in self.build_rows.iter().enumerate() {
+                let key = &row.values[self.right_col_idx];
+                let mut h1 = Fnv1aHasher::default();
+                let mut h2 = AlternateHasher::default();
+                key.hash(&mut h1);
+                key.hash(&mut h2);
+                self.bloom_filter.insert(h1.finish(), h2.finish());
+                self.hash_table.entry(key.clone()).or_insert_with(Vec::new).push(idx);
+            }
+            self.hash_table.shrink_to_fit();
+            self.initialized = true;
+        }
+
+        if self.match_idx < self.match_indices.len() {
+            let left = self.left_row.as_ref().unwrap();
+            let right = &self.build_rows[self.match_indices[self.match_idx]];
+            self.match_idx += 1;
+            return Some(Row::combine(left, right));
+        }
+
+        loop {
+            self.match_indices.clear();
+            self.match_idx = 0;
+
+            self.left_row = self.left_child.next();
+            let left = self.left_row.as_ref()?;
+            let key = &left.values[self.left_col_idx];
+
+            let mut h1 = Fnv1aHasher::default();
+            let mut h2 = AlternateHasher::default();
+            key.hash(&mut h1);
+            key.hash(&mut h2);
+
+            if !self.bloom_filter.contains(h1.finish(), h2.finish()) {
+                continue;
+            }
+
+            if let Some(matches) = self.hash_table.get(key) {
+                self.match_indices.extend_from_slice(matches);
+                let right = &self.build_rows[self.match_indices[0]];
+                self.match_idx = 1;
+                return Some(Row::combine(left, right));
+            }
+        }
+    }
+}
+
+struct ScratchRunScanOperator<'a, R: Read, W: Write> {
+    reader: ScratchRunReader<'a, R, W>,
+}
+impl<'a, R: Read, W: Write> ScratchRunScanOperator<'a, R, W> {
+    fn new(
+        pool_ptr: *mut BufferPoolManager<R, W>,
+        run: &ScratchRun,
+        block_size: usize,
+        free_on_drop: bool,
+    ) -> Self {
+        Self {
+            reader: ScratchRunReader::new(
+                pool_ptr,
+                run.spans.clone(),
+                run.total_bytes,
+                block_size,
+                free_on_drop,
+            ),
+        }
+    }
+}
+impl<'a, R: Read, W: Write> Operator for ScratchRunScanOperator<'a, R, W> {
+    #[inline(always)]
+    fn next(&mut self) -> Option<Row> {
+        self.reader.read_row()
+    }
+}
+
+struct PartitionHashJoinState<'a, R: Read, W: Write> {
+    probe_reader: ScratchRunReader<'a, R, W>,
+    build_rows: Vec<Row>,
+    hash_table: FastMap<Value, Vec<usize>>,
+    build_key_idx: usize,
+    probe_key_idx: usize,
+    build_is_right: bool,
+    current_probe_row: Option<Row>,
+    current_match_indices: Vec<usize>,
+    match_pos: usize,
+}
+
+impl<'a, R: Read, W: Write> PartitionHashJoinState<'a, R, W> {
+    fn new(
+        probe_reader: ScratchRunReader<'a, R, W>,
+        build_rows: Vec<Row>,
+        build_key_idx: usize,
+        probe_key_idx: usize,
+        build_is_right: bool,
+    ) -> Self {
+        Self {
+            probe_reader,
+            build_rows,
+            hash_table: FastMap::default(),
+            build_key_idx,
+            probe_key_idx,
+            build_is_right,
+            current_probe_row: None,
+            current_match_indices: Vec::new(),
+            match_pos: 0,
+        }
+    }
+
+    fn init_hash_table(&mut self) {
+        for (idx, row) in self.build_rows.iter().enumerate() {
+            let key = &row.values[self.build_key_idx];
+            self.hash_table
+                .entry(key.clone())
+                .or_insert_with(Vec::new)
+                .push(idx);
+        }
+        self.hash_table.shrink_to_fit();
+    }
+
+    fn next_row(&mut self) -> Option<Row> {
+        if self.hash_table.is_empty() && !self.build_rows.is_empty() {
+            self.init_hash_table();
+        }
+
+        if self.match_pos < self.current_match_indices.len() {
+            let probe = self.current_probe_row.as_ref().unwrap();
+            let build = &self.build_rows[self.current_match_indices[self.match_pos]];
+            self.match_pos += 1;
+            return Some(if self.build_is_right {
+                Row::combine(probe, build)
+            } else {
+                Row::combine(build, probe)
+            });
+        }
+
+        loop {
+            self.current_match_indices.clear();
+            self.match_pos = 0;
+            self.current_probe_row = self.probe_reader.read_row();
+            let probe = self.current_probe_row.as_ref()?;
+            let key = &probe.values[self.probe_key_idx];
+            if let Some(matches) = self.hash_table.get(key) {
+                self.current_match_indices.extend_from_slice(matches);
+                let build = &self.build_rows[self.current_match_indices[0]];
+                self.match_pos = 1;
+                return Some(if self.build_is_right {
+                    Row::combine(probe, build)
+                } else {
+                    Row::combine(build, probe)
+                });
+            }
+        }
+    }
+}
+
+pub struct GraceHashJoinOperator<'a, R: Read + 'a, W: Write + 'a> {
+    left_child: Option<Box<dyn Operator + 'a>>,
+    right_child: Option<Box<dyn Operator + 'a>>,
+    left_col_idx: usize,
+    right_col_idx: usize,
+    memory_limit_bytes: usize,
+    scratch_pool_ptr: *mut BufferPoolManager<R, W>,
+    scratch_block_size: usize,
+    initialized: bool,
+    partitions_left: Vec<ScratchRun>,
+    partitions_right: Vec<ScratchRun>,
+    partition_idx: usize,
+    active_hash: Option<PartitionHashJoinState<'a, R, W>>,
+    active_fallback: Option<Box<dyn Operator + 'a>>,
+}
+
+impl<'a, R: Read + 'a, W: Write + 'a> GraceHashJoinOperator<'a, R, W> {
+    pub fn new(
+        left: Box<dyn Operator + 'a>,
+        right: Box<dyn Operator + 'a>,
+        left_col_idx: usize,
+        right_col_idx: usize,
+        memory_limit_bytes: usize,
+        scratch_pool_ptr: *mut BufferPoolManager<R, W>,
+        scratch_block_size: usize,
+    ) -> Self {
+        let bounded = memory_limit_bytes.max(MIN_OPERATOR_MEMORY_BYTES);
+        Self {
+            left_child: Some(left),
+            right_child: Some(right),
+            left_col_idx,
+            right_col_idx,
+            memory_limit_bytes: bounded,
+            scratch_pool_ptr,
+            scratch_block_size,
+            initialized: false,
+            partitions_left: Vec::new(),
+            partitions_right: Vec::new(),
+            partition_idx: 0,
+            active_hash: None,
+            active_fallback: None,
+        }
+    }
+
+    fn choose_partitions(&self) -> usize {
+        let m = self.memory_limit_bytes;
+        let mut p = if m >= 8 * 1024 * 1024 {
+            64
+        } else if m >= 4 * 1024 * 1024 {
+            32
+        } else if m >= 2 * 1024 * 1024 {
+            16
+        } else {
+            8
+        };
+        p = p.clamp(GRACE_HASH_MIN_PARTITIONS, GRACE_HASH_MAX_PARTITIONS);
+        p.next_power_of_two()
+    }
+
+    fn partition_child(
+        &self,
+        mut child: Box<dyn Operator + 'a>,
+        key_idx: usize,
+        num_partitions: usize,
+    ) -> Vec<ScratchRun> {
+        let flush_threshold = (self.memory_limit_bytes / 4)
+            .clamp(512 * 1024, 4 * 1024 * 1024)
+            .max(self.scratch_block_size);
+        let mut bm = SharedBufferManager::new(
+            self.scratch_pool_ptr,
+            num_partitions,
+            self.scratch_block_size,
+            flush_threshold,
+        );
+        while let Some(row) = child.next() {
+            let key = &row.values[key_idx];
+            let mut h = Fnv1aHasher::default();
+            key.hash(&mut h);
+            let p = (h.finish() as usize) & (num_partitions - 1);
+            bm.write_row(p, &row);
+        }
+        bm.finish()
+    }
+
+    fn free_run(&self, run: &ScratchRun) {
+        let pool = unsafe { &mut *self.scratch_pool_ptr };
+        for span in &run.spans {
+            for i in 0..span.num_blocks {
+                pool.disk_manager
+                    .free_anon_block(span.start_block + (i as u64));
+            }
+        }
+    }
+
+    fn start_next_partition(&mut self) {
+        self.active_hash = None;
+        self.active_fallback = None;
+
+        while self.partition_idx < self.partitions_left.len() {
+            let left_run = &self.partitions_left[self.partition_idx];
+            let right_run = &self.partitions_right[self.partition_idx];
+            self.partition_idx += 1;
+
+            if left_run.total_bytes == 0 || right_run.total_bytes == 0 {
+                self.free_run(left_run);
+                self.free_run(right_run);
+                continue;
+            }
+
+            let build_is_right = right_run.total_bytes <= left_run.total_bytes;
+            let build_run = if build_is_right { right_run } else { left_run };
+            let probe_run = if build_is_right { left_run } else { right_run };
+
+            let (build_key_idx, probe_key_idx) = if build_is_right {
+                (self.right_col_idx, self.left_col_idx)
+            } else {
+                (self.left_col_idx, self.right_col_idx)
+            };
+
+            let mut build_reader = ScratchRunReader::new(
+                self.scratch_pool_ptr,
+                build_run.spans.clone(),
+                build_run.total_bytes,
+                self.scratch_block_size,
+                false,
+            );
+            let mut build_rows = Vec::new();
+            let mut mem = 0usize;
+            let mut overflow = false;
+            while let Some(r) = build_reader.read_row() {
+                mem += r.encoded_len() + 96;
+                build_rows.push(r);
+                if mem > self.memory_limit_bytes {
+                    overflow = true;
+                    break;
+                }
+            }
+
+            if !overflow {
+                let probe_reader = ScratchRunReader::new(
+                    self.scratch_pool_ptr,
+                    probe_run.spans.clone(),
+                    probe_run.total_bytes,
+                    self.scratch_block_size,
+                    false, 
+                );
+                self.active_hash = Some(PartitionHashJoinState::new(
+                    probe_reader,
+                    build_rows,
+                    build_key_idx,
+                    probe_key_idx,
+                    build_is_right,
+                ));
+                return;
+            }
+
+            // Build side overflows memory — free the partial build_rows immediately
+            // to reclaim memory before creating sort operators.
+            drop(build_rows);
+
+            let left_scan: Box<dyn Operator + 'a> = Box::new(ScratchRunScanOperator::new(
+                self.scratch_pool_ptr,
+                left_run,
+                self.scratch_block_size,
+                false,
+            ));
+            let right_scan: Box<dyn Operator + 'a> = Box::new(ScratchRunScanOperator::new(
+                self.scratch_pool_ptr,
+                right_run,
+                self.scratch_block_size,
+                false,
+            ));
+
+            let l_sort: Box<dyn Operator + 'a> = Box::new(crate::operators::sort::SortOperator::new(
+                left_scan,
+                vec![(self.left_col_idx, true)],
+                self.memory_limit_bytes,
+                self.scratch_pool_ptr,
+                self.scratch_block_size,
+            ));
+            let r_sort: Box<dyn Operator + 'a> = Box::new(crate::operators::sort::SortOperator::new(
+                right_scan,
+                vec![(self.right_col_idx, true)],
+                self.memory_limit_bytes,
+                self.scratch_pool_ptr,
+                self.scratch_block_size,
+            ));
+
+            self.active_fallback = Some(Box::new(SortMergeJoinOperator::new(
+                l_sort,
+                r_sort,
+                self.left_col_idx,
+                self.right_col_idx,
+                self.scratch_pool_ptr,
+                self.scratch_block_size,
+                self.memory_limit_bytes,
+            )));
+            return;
+        }
+    }
+}
+
+// 🚀 CRITICAL DISK LEAK FIX: Free active partitions if dropped early
+impl<'a, R: Read + 'a, W: Write + 'a> Drop for GraceHashJoinOperator<'a, R, W> {
+    fn drop(&mut self) {
+        let start = if self.active_hash.is_some() || self.active_fallback.is_some() {
+            self.partition_idx.saturating_sub(1)
+        } else {
+            self.partition_idx
+        };
+        let pool = unsafe { &mut *self.scratch_pool_ptr };
+        for i in start..self.partitions_left.len() {
+            for span in &self.partitions_left[i].spans {
+                for j in 0..span.num_blocks {
+                    pool.disk_manager.free_anon_block(span.start_block + (j as u64));
+                }
+            }
+            for span in &self.partitions_right[i].spans {
+                for j in 0..span.num_blocks {
+                    pool.disk_manager.free_anon_block(span.start_block + (j as u64));
+                }
+            }
+        }
+    }
+}
+
+impl<'a, R: Read + 'a, W: Write + 'a> Operator for GraceHashJoinOperator<'a, R, W> {
+    fn next(&mut self) -> Option<Row> {
+        if !self.initialized {
+            let num_partitions = self.choose_partitions();
+            let left = self.left_child.take().unwrap();
+            let right = self.right_child.take().unwrap();
+            self.partitions_left = self.partition_child(left, self.left_col_idx, num_partitions);
+            self.partitions_right = self.partition_child(right, self.right_col_idx, num_partitions);
+            self.partition_idx = 0;
+            self.initialized = true;
+            self.start_next_partition();
+        }
+
+        loop {
+            if let Some(h) = self.active_hash.as_mut() {
+                if let Some(row) = h.next_row() {
+                    return Some(row);
+                }
+                let done_idx = self.partition_idx.saturating_sub(1);
+                if done_idx < self.partitions_left.len() {
+                    self.free_run(&self.partitions_left[done_idx]);
+                    self.free_run(&self.partitions_right[done_idx]);
+                }
+                self.start_next_partition();
+                continue;
+            }
+
+            if let Some(op) = self.active_fallback.as_mut() {
+                if let Some(row) = op.next() {
+                    return Some(row);
+                }
+                let done_idx = self.partition_idx.saturating_sub(1);
+                if done_idx < self.partitions_left.len() {
+                    self.free_run(&self.partitions_left[done_idx]);
+                    self.free_run(&self.partitions_right[done_idx]);
+                }
+                self.active_fallback = None;
+                self.start_next_partition();
+                continue;
+            }
+
+            return None;
+        }
+    }
+}
+
+pub struct SortMergeJoinOperator<'a, R: Read, W: Write> {
+    left_child: Box<dyn Operator + 'a>,
+    right_child: Box<dyn Operator + 'a>,
+    left_col_idx: usize,
+    right_col_idx: usize,
+    left_row: Option<Row>,
+    right_row: Option<Row>,
+    right_buffer: Vec<Row>,
+    right_buffer_idx: usize,
+    match_key: Option<Value>,
+    initialized: bool,
+    spilled_run: Option<ScratchRun>,
+    spilled_reader: Option<ScratchRunReader<'a, R, W>>,
+    scratch_pool_ptr: *mut BufferPoolManager<R, W>,
+    scratch_block_size: usize,
+    memory_limit_bytes: usize,
+}
+
+impl<'a, R: Read, W: Write> Drop for SortMergeJoinOperator<'a, R, W> {
+    fn drop(&mut self) {
+        if let Some(run) = &self.spilled_run {
+            let pool = unsafe { &mut *self.scratch_pool_ptr };
+            for span in &run.spans {
+                for i in 0..span.num_blocks {
+                    pool.disk_manager
+                        .free_anon_block(span.start_block + (i as u64));
+                }
+            }
+        }
+    }
+}
+
+impl<'a, R: Read, W: Write> SortMergeJoinOperator<'a, R, W> {
+    pub fn new(
+        left: Box<dyn Operator + 'a>,
+        right: Box<dyn Operator + 'a>,
+        left_col_idx: usize,
+        right_col_idx: usize,
+        scratch_pool_ptr: *mut BufferPoolManager<R, W>,
+        scratch_block_size: usize,
+        memory_limit_bytes: usize,
+    ) -> Self {
+        Self {
+            left_child: left,
+            right_child: right,
+            left_col_idx,
+            right_col_idx,
+            left_row: None,
+            right_row: None,
+            right_buffer: Vec::new(),
+            right_buffer_idx: 0,
+            match_key: None,
+            initialized: false,
+            spilled_run: None,
+            spilled_reader: None,
+            scratch_pool_ptr,
+            scratch_block_size,
+            memory_limit_bytes,
+        }
+    }
+
+    #[inline(always)]
+    fn compare_values_ord(lhs: &Value, rhs: &Value) -> Ordering {
+        lhs.partial_cmp(rhs).unwrap_or(Ordering::Equal)
+    }
+}
+
+impl<'a, R: Read, W: Write> Operator for SortMergeJoinOperator<'a, R, W> {
+    fn next(&mut self) -> Option<Row> {
+        if !self.initialized {
+            self.left_row = self.left_child.next();
+            self.right_row = self.right_child.next();
+            self.initialized = true;
+        }
+
+        loop {
+            if self.right_buffer_idx < self.right_buffer.len() {
+                let left = self.left_row.as_ref().unwrap();
+                let right = &self.right_buffer[self.right_buffer_idx];
+                self.right_buffer_idx += 1;
+                return Some(Row::combine(left, right));
+            }
+
+            if let Some(reader) = self.spilled_reader.as_mut() {
+                if let Some(right) = reader.read_row() {
+                    let left = self.left_row.as_ref().unwrap();
+                    return Some(Row::combine(left, &right));
+                }
+            }
+
+            if !self.right_buffer.is_empty() || self.spilled_run.is_some() {
+                self.left_row = self.left_child.next();
+                if let Some(left) = &self.left_row {
+                    let left_key = &left.values[self.left_col_idx];
+                    if Some(left_key) == self.match_key.as_ref() {
+                        self.right_buffer_idx = 0;
+                        if let Some(run) = &self.spilled_run {
+                            self.spilled_reader = Some(ScratchRunReader::new(
+                                self.scratch_pool_ptr,
+                                run.spans.clone(),
+                                run.total_bytes,
+                                self.scratch_block_size,
+                                false 
+                            ));
+                        }
+                        continue;
+                    }
+                }
+                
+                self.right_buffer.clear();
+                if let Some(run) = self.spilled_run.take() {
+                    let pool = unsafe { &mut *self.scratch_pool_ptr };
+                    for span in &run.spans {
+                        for i in 0..span.num_blocks {
+                            pool.disk_manager
+                                .free_anon_block(span.start_block + (i as u64));
+                        }
+                    }
+                }
+                self.spilled_reader = None;
+                self.match_key = None;
+            }
+
+            let left = self.left_row.as_ref()?;
+            let right = self.right_row.as_ref()?;
+            let left_key = &left.values[self.left_col_idx];
+            let right_key = &right.values[self.right_col_idx];
+
+            match Self::compare_values_ord(left_key, right_key) {
+                Ordering::Less => self.left_row = self.left_child.next(),
+                Ordering::Greater => self.right_row = self.right_child.next(),
+                Ordering::Equal => {
+                    self.match_key = Some(left_key.clone());
+                    
+                    let mut mem_usage = 0;
+                    let mut writer: Option<ScratchRunWriter<R, W>> = None;
+
+                    self.right_buffer.push(right.clone());
+                    mem_usage += right.encoded_len();
+                    self.right_row = self.right_child.next();
+
+                    while let Some(r) = &self.right_row {
+                        if &r.values[self.right_col_idx] == left_key {
+                            if writer.is_none() && mem_usage + r.encoded_len() > self.memory_limit_bytes {
+                                writer = Some(ScratchRunWriter::new(
+                                    self.scratch_pool_ptr,
+                                    self.scratch_block_size,
+                                    scratch_writer_blocks(self.scratch_block_size),
+                                ));
+                            }
+
+                            if let Some(w) = writer.as_mut() {
+                                w.write_row(r); 
+                            } else {
+                                self.right_buffer.push(r.clone());
+                                mem_usage += r.encoded_len();
+                            }
+                            self.right_row = self.right_child.next();
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if let Some(w) = writer {
+                        let run = w.finish();
+                        self.spilled_reader = Some(ScratchRunReader::new(
+                            self.scratch_pool_ptr,
+                            run.spans.clone(),
+                            run.total_bytes,
+                            self.scratch_block_size,
+                            false,
+                        ));
+                        self.spilled_run = Some(run);
+                    }
+
+                    self.right_buffer_idx = 0;
+                }
+            }
+        }
+    }
+}
+
+pub struct AdaptiveJoinOperator<'a, R: Read + 'a, W: Write + 'a> {
+    left_child: Option<Box<dyn Operator + 'a>>,
+    right_child: Option<Box<dyn Operator + 'a>>,
+    left_col_idx: usize,
+    right_col_idx: usize,
+    sort_memory_limit: usize,
+    left_est_rows: f64,
+    right_est_rows: f64,
+    scratch_pool_ptr: *mut BufferPoolManager<R, W>,
+    scratch_block_size: usize,
+    active_strategy: Option<Box<dyn Operator + 'a>>,
+}
+
+impl<'a, R: Read + 'a, W: Write + 'a> AdaptiveJoinOperator<'a, R, W> {
+    pub fn new(
+        left: Box<dyn Operator + 'a>,
+        right: Box<dyn Operator + 'a>,
+        left_col_idx: usize,
+        right_col_idx: usize,
+        sort_memory_limit: usize,
+        left_est_rows: f64,
+        right_est_rows: f64,
+        scratch_pool_ptr: *mut BufferPoolManager<R, W>,
+        scratch_block_size: usize,
+    ) -> Self {
+        Self {
+            left_child: Some(left),
+            right_child: Some(right),
+            left_col_idx,
+            right_col_idx,
+            sort_memory_limit,
+            left_est_rows,
+            right_est_rows,
+            scratch_pool_ptr,
+            scratch_block_size,
+            active_strategy: None,
+        }
+    }
+
+    #[inline(always)]
+    fn estimate_row_size(&self, row: &Row) -> usize {
+        row.encoded_len() + 96
+    }
+}
+
+impl<'a, R: Read + 'a, W: Write + 'a> Operator for AdaptiveJoinOperator<'a, R, W> {
+    fn next(&mut self) -> Option<Row> {
+        if self.active_strategy.is_none() {
+            let mut right_child = self.right_child.take().unwrap();
+            let mut buffered_rows = Vec::with_capacity(1024);
+            let mut current_memory = 0;
+            let mut sample_bytes = 0usize;
+            let mut sample_rows = 0usize;
+
+            let max_memory = ((self.sort_memory_limit * 5) / 8).max(1 * 1024 * 1024);
+            let mut memory_breached = false;
+
+            while let Some(row) = right_child.next() {
+                current_memory += self.estimate_row_size(&row);
+                if sample_rows < 256 {
+                    sample_bytes += row.encoded_len();
+                    sample_rows += 1;
+                }
+                buffered_rows.push(row);
+                if current_memory > max_memory {
+                    memory_breached = true;
+                    break;
+                }
+            }
+            if !memory_breached {
+                buffered_rows.shrink_to_fit();
+            }
+
+            let left_child = self.left_child.take().unwrap();
+            if !memory_breached {
+                self.active_strategy = Some(Box::new(InMemoryHashJoinOperator::new(
+                    left_child,
+                    buffered_rows,
+                    self.left_col_idx,
+                    self.right_col_idx,
+                )));
+            } else {
+                let heavy_right: Box<dyn Operator + 'a> =
+                    Box::new(BufferedOperator::new(buffered_rows, right_child));
+
+                let avg_row_bytes = if sample_rows == 0 {
+                    64.0
+                } else {
+                    (sample_bytes as f64 / sample_rows as f64).max(8.0)
+                };
+                let est_input_bytes =
+                    (self.left_est_rows + self.right_est_rows).max(1.0) * avg_row_bytes;
+
+                let use_grace_hash = est_input_bytes > (self.sort_memory_limit as f64 * 4.0);
+
+                if use_grace_hash {
+                    self.active_strategy = Some(Box::new(GraceHashJoinOperator::new(
+                        left_child,
+                        heavy_right,
+                        self.left_col_idx,
+                        self.right_col_idx,
+                        self.sort_memory_limit,
+                        self.scratch_pool_ptr,
+                        self.scratch_block_size,
+                    )));
+                } else {
+                    let l_sort: Box<dyn Operator + 'a> =
+                        Box::new(crate::operators::sort::SortOperator::new(
+                            left_child,
+                            vec![(self.left_col_idx, true)],
+                            self.sort_memory_limit / 2,
+                            self.scratch_pool_ptr,
+                            self.scratch_block_size,
+                        ));
+                    let r_sort: Box<dyn Operator + 'a> =
+                        Box::new(crate::operators::sort::SortOperator::new(
+                            heavy_right,
+                            vec![(self.right_col_idx, true)],
+                            self.sort_memory_limit / 2,
+                            self.scratch_pool_ptr,
+                            self.scratch_block_size,
+                        ));
+                    self.active_strategy = Some(Box::new(SortMergeJoinOperator::new(
+                        l_sort,
+                        r_sort,
+                        self.left_col_idx,
+                        self.right_col_idx,
+                        self.scratch_pool_ptr,
+                        self.scratch_block_size,
+                        self.sort_memory_limit,
+                    )));
+                }
+            }
+        }
+        self.active_strategy.as_mut().unwrap().next()
+    }
+}
 
 pub struct CrossOperator<'a, R: Read, W: Write> {
     left_child: Option<Box<dyn Operator + 'a>>,
@@ -33,6 +862,8 @@ pub struct CrossOperator<'a, R: Read, W: Write> {
     initialized: bool,
     current_stream_row: Option<Row>,
     materialized_idx: usize,
+    memory_limit_bytes: usize,
+    stream_chunk_limit_bytes: usize,
 }
 
 impl<'a, R: Read, W: Write> CrossOperator<'a, R, W> {
@@ -42,7 +873,9 @@ impl<'a, R: Read, W: Write> CrossOperator<'a, R, W> {
         mat_left: bool,
         pool_ptr: *mut BufferPoolManager<R, W>,
         block_size: usize,
+        memory_limit_bytes: usize,
     ) -> Self {
+        let bounded_limit = memory_limit_bytes.max(MIN_OPERATOR_MEMORY_BYTES);
         Self {
             left_child: Some(left),
             right_child: Some(right),
@@ -60,7 +893,16 @@ impl<'a, R: Read, W: Write> CrossOperator<'a, R, W> {
             initialized: false,
             current_stream_row: None,
             materialized_idx: 0,
+            memory_limit_bytes: bounded_limit,
+            stream_chunk_limit_bytes: bounded_limit
+                .max(MIN_CROSS_STREAM_CHUNK_BYTES)
+                .min(8 * 1024 * 1024),
         }
+    }
+
+    #[inline(always)]
+    fn estimate_row_size(row: &Row) -> usize {
+        row.encoded_len() + 96
     }
 }
 
@@ -68,8 +910,11 @@ impl<'a, R: Read, W: Write> Drop for CrossOperator<'a, R, W> {
     fn drop(&mut self) {
         if let Some(run) = &self.spilled_run {
             let pool = unsafe { &mut *self.scratch_pool_ptr };
-            for &id in &run.block_ids {
-                pool.disk_manager.free_anon_block(id);
+            for span in &run.spans {
+                for i in 0..span.num_blocks {
+                    pool.disk_manager
+                        .free_anon_block(span.start_block + (i as u64));
+                }
             }
         }
     }
@@ -83,25 +928,19 @@ impl<'a, R: Read, W: Write> Operator for CrossOperator<'a, R, W> {
             } else {
                 self.right_child.take().unwrap()
             };
-            let mut mem_usage = 0;
+            let mut mem_usage: usize = 0;
             let mut writer = None;
 
             while let Some(row) = child.next() {
-                let row_size = std::mem::size_of::<Row>()
-                    + row
-                        .values
-                        .iter()
-                        .map(|v| match v {
-                            Value::String(s) => s.len(),
-                            _ => 8,
-                        })
-                        .sum::<usize>();
-                mem_usage += row_size;
+                mem_usage = mem_usage.saturating_add(Self::estimate_row_size(&row));
 
-                if !self.materialized_spilled && mem_usage > 10 * 1024 * 1024 {
+                if !self.materialized_spilled && mem_usage >= self.memory_limit_bytes {
                     self.materialized_spilled = true;
-                    let mut w =
-                        ScratchRunWriter::new(self.scratch_pool_ptr, self.scratch_block_size, 1024);
+                    let mut w = ScratchRunWriter::new(
+                        self.scratch_pool_ptr,
+                        self.scratch_block_size,
+                        scratch_writer_blocks(self.scratch_block_size),
+                    );
                     for r in &self.in_memory_materialized {
                         w.write_row(r);
                     }
@@ -159,16 +998,16 @@ impl<'a, R: Read, W: Write> Operator for CrossOperator<'a, R, W> {
                     if self.stream_exhausted {
                         return None;
                     }
-                    let mut bytes = 0;
+                    let mut bytes: usize = 0;
                     let stream = if self.materialize_left {
                         self.right_child.as_mut().unwrap()
                     } else {
                         self.left_child.as_mut().unwrap()
                     };
 
-                    while bytes < 10 * 1024 * 1024 {
+                    while bytes < self.stream_chunk_limit_bytes {
                         if let Some(r) = stream.next() {
-                            bytes += std::mem::size_of::<Row>() + (r.values.capacity() * 8);
+                            bytes = bytes.saturating_add(Self::estimate_row_size(&r));
                             self.stream_chunk.push(r);
                         } else {
                             self.stream_exhausted = true;
@@ -182,7 +1021,7 @@ impl<'a, R: Read, W: Write> Operator for CrossOperator<'a, R, W> {
                     let run = self.spilled_run.as_ref().unwrap();
                     self.current_reader = Some(ScratchRunReader::new(
                         self.scratch_pool_ptr,
-                        run.block_ids.clone(),
+                        run.spans.clone(),
                         run.total_bytes,
                         self.scratch_block_size,
                         false,
@@ -206,350 +1045,6 @@ impl<'a, R: Read, W: Write> Operator for CrossOperator<'a, R, W> {
                     }
                 } else {
                     self.stream_chunk.clear();
-                }
-            }
-        }
-    }
-}
-
-#[derive(PartialEq)]
-enum JoinState {
-    Partitioning,
-    LoadingBuild,
-    Probing,
-    Done,
-}
-
-pub struct GraceHashJoinOperator<'a, R: Read, W: Write> {
-    left_child: Option<Box<dyn Operator + 'a>>,
-    right_child: Option<Box<dyn Operator + 'a>>,
-    left_col_idx: usize,
-    right_col_idx: usize,
-    build_on_left: bool,
-    num_partitions: usize,
-    scratch_pool_ptr: *mut BufferPoolManager<R, W>,
-    scratch_block_size: usize,
-    build_partitions: Vec<ScratchRun>,
-    probe_partitions: Vec<ScratchRun>,
-    in_memory_hash_table: FastMap<Value, Vec<usize>>,
-    in_memory_build_rows: Vec<Row>,
-    partition_0_spilled: bool,
-    partition_0_mem_usage: usize,
-    current_partition_idx: usize,
-    current_build_reader: Option<ScratchRunReader<'a, R, W>>,
-    current_probe_run: Option<ScratchRun>,
-    current_probe_reader: Option<ScratchRunReader<'a, R, W>>,
-    current_probe_row: Option<Row>,
-    current_match_key: Option<Value>,
-    current_match_index: usize,
-    state: JoinState,
-}
-
-impl<'a, R: Read, W: Write> GraceHashJoinOperator<'a, R, W> {
-    pub fn new(
-        left: Box<dyn Operator + 'a>,
-        right: Box<dyn Operator + 'a>,
-        l_idx: usize,
-        r_idx: usize,
-        build_left: bool,
-        parts: usize,
-        pool: *mut BufferPoolManager<R, W>,
-        b_size: usize,
-    ) -> Self {
-        Self {
-            left_child: Some(left),
-            right_child: Some(right),
-            left_col_idx: l_idx,
-            right_col_idx: r_idx,
-            build_on_left: build_left,
-            num_partitions: parts,
-            scratch_pool_ptr: pool,
-            scratch_block_size: b_size,
-            build_partitions: Vec::new(),
-            probe_partitions: Vec::new(),
-            in_memory_hash_table: FastMap::default(),
-            in_memory_build_rows: Vec::new(),
-            partition_0_spilled: false,
-            partition_0_mem_usage: 0,
-            current_partition_idx: 0,
-            current_build_reader: None,
-            current_probe_run: None,
-            current_probe_reader: None,
-            current_probe_row: None,
-            current_match_key: None,
-            current_match_index: 0,
-            state: JoinState::Partitioning,
-        }
-    }
-
-    #[inline(always)]
-    fn hash1(val: &Value) -> u64 {
-        let mut s = Fnv1aHasher::default();
-        val.hash(&mut s);
-        s.finish()
-    }
-
-    #[inline(always)]
-    fn hash2(val: &Value) -> u64 {
-        let mut s = AlternateHasher::default();
-        val.hash(&mut s);
-        s.finish()
-    }
-}
-
-impl<'a, R: Read, W: Write> Drop for GraceHashJoinOperator<'a, R, W> {
-    fn drop(&mut self) {
-        let pool = unsafe { &mut *self.scratch_pool_ptr };
-        for run in &self.build_partitions {
-            for &id in &run.block_ids {
-                pool.disk_manager.free_anon_block(id);
-            }
-        }
-        for run in &self.probe_partitions {
-            for &id in &run.block_ids {
-                pool.disk_manager.free_anon_block(id);
-            }
-        }
-        if let Some(run) = &self.current_probe_run {
-            for &id in &run.block_ids {
-                pool.disk_manager.free_anon_block(id);
-            }
-        }
-    }
-}
-
-impl<'a, R: Read, W: Write> Operator for GraceHashJoinOperator<'a, R, W> {
-    fn next(&mut self) -> Option<Row> {
-        loop {
-            match self.state {
-                JoinState::Partitioning => {
-                    let mut build_writer = SharedBufferManager::new(
-                        self.scratch_pool_ptr,
-                        self.num_partitions,
-                        self.scratch_block_size,
-                    );
-                    let mut build_child = if self.build_on_left {
-                        self.left_child.take()
-                    } else {
-                        self.right_child.take()
-                    }
-                    .unwrap();
-                    let build_idx = if self.build_on_left {
-                        self.left_col_idx
-                    } else {
-                        self.right_col_idx
-                    };
-
-                    let mut bloom = BloomFilter::new(2 * 1024 * 1024);
-
-                    while let Some(row) = build_child.next() {
-                        let key = &row.values[build_idx];
-                        let h1 = Self::hash1(key);
-                        let h2 = Self::hash2(key);
-                        bloom.insert(h1, h2);
-                        let p_idx = (h1 as usize) % self.num_partitions;
-
-                        if p_idx == 0 && !self.partition_0_spilled {
-                            let key_clone = key.clone();
-                            let r_idx = self.in_memory_build_rows.len();
-
-                            let size = 64
-                                + if let Value::String(s) = &row.values[build_idx] {
-                                    s.len()
-                                } else {
-                                    0
-                                };
-
-                            self.partition_0_mem_usage += size;
-                            self.in_memory_build_rows.push(row);
-                            self.in_memory_hash_table
-                                .entry(key_clone)
-                                .or_insert_with(Vec::new)
-                                .push(r_idx);
-
-                            if self.partition_0_mem_usage > 10 * 1024 * 1024 {
-                                for r in &self.in_memory_build_rows {
-                                    build_writer.write_row(0, r);
-                                }
-                                self.in_memory_build_rows.clear();
-                                self.in_memory_hash_table.clear();
-                                self.partition_0_spilled = true;
-                            }
-                        } else {
-                            build_writer.write_row(p_idx, &row);
-                        }
-                    }
-                    self.build_partitions = build_writer.finish();
-
-                    let mut probe_writer = SharedBufferManager::new(
-                        self.scratch_pool_ptr,
-                        self.num_partitions,
-                        self.scratch_block_size,
-                    );
-                    let mut probe_child = if self.build_on_left {
-                        self.right_child.take()
-                    } else {
-                        self.left_child.take()
-                    }
-                    .unwrap();
-                    let probe_idx = if self.build_on_left {
-                        self.right_col_idx
-                    } else {
-                        self.left_col_idx
-                    };
-
-                    while let Some(row) = probe_child.next() {
-                        let key = &row.values[probe_idx];
-                        let h1 = Self::hash1(key);
-                        let h2 = Self::hash2(key);
-                        if bloom.contains(h1, h2) {
-                            let p_idx = (h1 as usize) % self.num_partitions;
-                            probe_writer.write_row(p_idx, &row);
-                        }
-                    }
-                    self.probe_partitions = probe_writer.finish();
-                    self.state = JoinState::LoadingBuild;
-                }
-
-                JoinState::LoadingBuild => {
-                    if self.current_build_reader.is_none() {
-                        if self.build_partitions.is_empty()
-                            && self.current_partition_idx >= self.num_partitions
-                        {
-                            self.state = JoinState::Done;
-                            return None;
-                        }
-                        let build_run = self.build_partitions.remove(0);
-                        self.current_probe_run = Some(self.probe_partitions.remove(0));
-                        if self.current_partition_idx == 0 && !self.partition_0_spilled {
-                            let probe_run = self.current_probe_run.as_ref().unwrap();
-                            self.current_probe_reader = Some(ScratchRunReader::new(
-                                self.scratch_pool_ptr,
-                                probe_run.block_ids.clone(),
-                                probe_run.total_bytes,
-                                self.scratch_block_size,
-                                false,
-                            ));
-                            self.current_probe_row =
-                                self.current_probe_reader.as_mut().unwrap().read_row();
-                            self.state = JoinState::Probing;
-                            continue;
-                        }
-                        self.in_memory_hash_table.clear();
-                        self.in_memory_build_rows.clear();
-                        self.current_build_reader = Some(ScratchRunReader::new(
-                            self.scratch_pool_ptr,
-                            build_run.block_ids,
-                            build_run.total_bytes,
-                            self.scratch_block_size,
-                            true,
-                        ));
-                    }
-
-                    let mut current_memory = 0;
-                    let build_idx = if self.build_on_left {
-                        self.left_col_idx
-                    } else {
-                        self.right_col_idx
-                    };
-                    let build_reader = self.current_build_reader.as_mut().unwrap();
-
-                    while let Some(row) = build_reader.read_row() {
-                        let key = row.values[build_idx].clone();
-                        let row_idx = self.in_memory_build_rows.len();
-
-                        let size = 64
-                            + if let Value::String(s) = &row.values[build_idx] {
-                                s.len()
-                            } else {
-                                0
-                            };
-
-                        current_memory += size;
-                        self.in_memory_build_rows.push(row);
-                        self.in_memory_hash_table
-                            .entry(key)
-                            .or_insert_with(Vec::new)
-                            .push(row_idx);
-
-                        if current_memory > 10 * 1024 * 1024 {
-                            break;
-                        }
-                    }
-
-                    let probe_run = self.current_probe_run.as_ref().unwrap();
-                    self.current_probe_reader = Some(ScratchRunReader::new(
-                        self.scratch_pool_ptr,
-                        probe_run.block_ids.clone(),
-                        probe_run.total_bytes,
-                        self.scratch_block_size,
-                        false,
-                    ));
-                    self.current_probe_row = self.current_probe_reader.as_mut().unwrap().read_row();
-                    self.state = JoinState::Probing;
-                }
-
-                JoinState::Probing => {
-                    if self.current_probe_row.is_none() {
-                        self.current_probe_reader = None;
-                        let has_more_build = self
-                            .current_build_reader
-                            .as_ref()
-                            .map_or(false, |r| r.has_more());
-
-                        if has_more_build {
-                            self.state = JoinState::LoadingBuild;
-                        } else {
-                            self.current_build_reader = None;
-                            if let Some(run) = self.current_probe_run.take() {
-                                let pool = unsafe { &mut *self.scratch_pool_ptr };
-                                for &id in &run.block_ids {
-                                    pool.disk_manager.free_anon_block(id);
-                                }
-                            }
-                            self.current_partition_idx += 1;
-                            self.state = JoinState::LoadingBuild;
-                        }
-                        continue;
-                    }
-                    let probe_row = self.current_probe_row.as_ref().unwrap();
-                    if let Some(key) = self.current_match_key.as_ref() {
-                        if let Some(build_rows) = self.in_memory_hash_table.get(key) {
-                            if self.current_match_index < build_rows.len() {
-                                let b_row = &self.in_memory_build_rows
-                                    [build_rows[self.current_match_index]];
-                                self.current_match_index += 1;
-                                let (l, r) = if self.build_on_left {
-                                    (b_row, probe_row)
-                                } else {
-                                    (probe_row, b_row)
-                                };
-                                return Some(Row::combine(l, r));
-                            }
-                        }
-                        self.current_probe_row =
-                            self.current_probe_reader.as_mut().unwrap().read_row();
-                        self.current_match_key = None;
-                        self.current_match_index = 0;
-                        continue;
-                    }
-
-                    let probe_idx = if self.build_on_left {
-                        self.right_col_idx
-                    } else {
-                        self.left_col_idx
-                    };
-                    let key = probe_row.values[probe_idx].clone();
-                    if self.in_memory_hash_table.contains_key(&key) {
-                        self.current_match_key = Some(key);
-                        self.current_match_index = 0;
-                    } else {
-                        self.current_probe_row =
-                            self.current_probe_reader.as_mut().unwrap().read_row();
-                    }
-                }
-                JoinState::Done => {
-                    return None;
                 }
             }
         }
